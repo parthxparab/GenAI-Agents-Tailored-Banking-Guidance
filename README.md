@@ -1,10 +1,8 @@
-# DevOps-Hackathon-Toronto-Team-5
+# Security & Compliance Team 5
 Canada DevOps Community of Practice Hackathon Toronto - Team 5 
 
-Project Name - TBD
+Project Name - Security & Compliance
 Team Mentor -
 
 Participant Names - 
-
-     Team Lead - 
      Team Members - Path Parab
