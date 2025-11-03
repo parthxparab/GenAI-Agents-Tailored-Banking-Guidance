@@ -24,12 +24,56 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
     from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 API_BASE_URL = os.getenv("GATEWAY_URL", "http://localhost:8000")
-REQUEST_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
-STATUS_POLL_INTERVAL = float(os.getenv("STATUS_POLL_INTERVAL", "2.0"))
-STATUS_POLL_TIMEOUT = int(os.getenv("STATUS_POLL_TIMEOUT", "120"))
+REQUEST_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", 1800))
+# Poll every few seconds so UI reflects backend progress promptly.
+STATUS_POLL_INTERVAL = float(os.getenv("STATUS_POLL_INTERVAL", 5))
+STATUS_POLL_TIMEOUT = int(os.getenv("STATUS_POLL_TIMEOUT", 600))
 STAGE_ORDER = ["conversation", "kyc", "advisor", "audit"]
 
 st.set_page_config(page_title="BankBot Crew Onboarding", page_icon="🏦", layout="centered")
+
+QUESTION_DEFINITIONS = [
+    (
+        "q1_credit_history",
+        "Are you looking to build or improve your credit score, or do you already have an established credit history?",
+        [
+            ("building", "I'm looking to build or improve my credit score"),
+            ("established", "I already have an established credit history"),
+        ],
+    ),
+    (
+        "q2_payment_style",
+        "Do you usually pay off your balance in full each month, or would you prefer a card with a lower interest rate for flexibility?",
+        [
+            ("full_payment", "I usually pay off my balance in full each month"),
+            ("lower_apr", "I'd like a lower interest rate for added flexibility"),
+        ],
+    ),
+    (
+        "q3_cashback",
+        "Would you like to earn cash back on your everyday spending, like groceries, gas, or dining?",
+        [
+            ("yes", "Yes, earning cashback would be helpful"),
+            ("no", "No, cashback rewards aren't important to me"),
+        ],
+    ),
+    (
+        "q4_travel",
+        "Do you travel often enough that earning airline miles or travel rewards would be valuable to you?",
+        [
+            ("yes", "Yes, I'd value travel rewards or airline miles"),
+            ("no", "No, I don't need travel-focused rewards"),
+        ],
+    ),
+    (
+        "q5_simple_card",
+        "Would you prefer something simple with no annual fee, just for convenience and everyday use?",
+        [
+            ("yes", "Yes, a simple no-fee card sounds ideal"),
+            ("no", "No, I'm open to cards with annual fees"),
+        ],
+    ),
+]
 
 
 def _ensure_state_defaults() -> None:
@@ -204,13 +248,23 @@ def render_recommendation_grid(recommendations: List[Dict[str, Any]]) -> None:
         for offset, card in enumerate(recommendations[idx : idx + chunk_size]):
             column = cols[offset]
             with column:
-                name = card.get("name") or f"Card {idx + offset + 1}"
+                name = card.get("card_name") or card.get("name") or f"Card {idx + offset + 1}"
                 st.subheader(name)
-                summary = card.get("summary") or card.get("description") or "Tailored credit card option."
-                st.write(summary)
-                details = {k: v for k, v in card.items() if k not in {"name", "summary", "description"}}
+                summary = card.get("summary") or card.get("description")
+                reason = card.get("why_recommended")
+                if summary:
+                    st.write(summary)
+                if reason:
+                    st.markdown(f"**Why recommended:** {reason}")
+                info_pairs = [
+                    ("Annual Fee", card.get("annual_fee")),
+                    ("Interest Rate", card.get("interest_rate")),
+                    ("Rewards", card.get("rewards")),
+                    ("Requirements", card.get("requirements")),
+                ]
+                details = [f"- **{label}:** {value}" for label, value in info_pairs if value]
                 if details:
-                    st.caption("\n".join(f"- **{k.title()}**: {v}" for k, v in details.items()))
+                    st.caption("\n".join(details))
 
 
 def render_confirmation_section(session_id: str, recommendations: List[Dict[str, Any]]) -> None:
@@ -218,7 +272,7 @@ def render_confirmation_section(session_id: str, recommendations: List[Dict[str,
     if not recommendations:
         return
 
-    card_names = [card.get("name") or f"Card {idx + 1}" for idx, card in enumerate(recommendations)]
+    card_names = [card.get("card_name") or card.get("name") or f"Card {idx + 1}" for idx, card in enumerate(recommendations)]
     st.session_state["selected_card"] = st.radio(
         "Select the card that best fits your needs:",
         card_names,
@@ -270,12 +324,20 @@ def main() -> None:
             occupation = st.text_input("Occupation", placeholder="Product Manager")
         with col2:
             email = st.text_input("Work Email", placeholder="alex@example.com")
-            preferences = st.text_area(
-                "Card Preferences",
-                placeholder="Reward categories, travel perks, cash back goals...",
-                height=100,
-            )
             document = st.file_uploader("Upload KYC Document (PDF/Image)", type=["pdf", "png", "jpg", "jpeg"])
+
+        st.markdown("### 🧭 Smart Goal-Based Credit Card Questions")
+        question_answers: Dict[str, str] = {}
+        for key, prompt, options in QUESTION_DEFINITIONS:
+            option_values = [value for value, _ in options]
+            labels = {value: label for value, label in options}
+            question_answers[key] = st.radio(
+                prompt,
+                options=option_values,
+                index=0,
+                format_func=lambda opt, labels=labels: labels[opt],
+                key=f"question_{key}",
+            )
 
         submitted = st.form_submit_button("Start Onboarding 🚀")
 
@@ -289,7 +351,7 @@ def main() -> None:
                 "email": email,
                 "income": income,
                 "occupation": occupation,
-                "preferences": preferences or None,
+                "questionnaire": question_answers,
                 "document_name": document_name,
                 "document_content": document_payload,
             }

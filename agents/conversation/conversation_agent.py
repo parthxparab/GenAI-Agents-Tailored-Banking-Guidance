@@ -1,93 +1,68 @@
-"""Conversation agent scaffold using a LangChain ConversationChain with Ollama."""
+"""Conversation agent that simply normalises incoming payloads for downstream agents."""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
+from datetime import datetime
 from typing import Any, Dict
 
-import requests
-from langchain.chains import ConversationChain
-from langchain.memory import ConversationBufferMemory
-from langchain_community.llms import Ollama
+from agents.base_agent import BaseAgent
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [ConversationAgent] %(message)s")
 LOGGER = logging.getLogger("conversation_agent")
 
 
-class ConversationAgent:
-    """Placeholder conversation agent to gather onboarding details."""
+class ConversationAgent(BaseAgent):
+    """Pass-through agent that forwards the gathered context to KYC and Advisor agents."""
 
-    def __init__(self, model_name: str = None) -> None:
-        self.model_name = model_name or os.getenv("CONVERSATION_AGENT_MODEL", "llama3")
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.enable_llm = os.getenv("ENABLE_OLLAMA", "false").lower() in {"1", "true", "yes"}
-        self.llm = Ollama(model=self.model_name, base_url=self.base_url) if self.enable_llm else None
-        self.memory = ConversationBufferMemory(return_messages=True) if self.enable_llm else None
-        self.chain = (
-            ConversationChain(llm=self.llm, memory=self.memory, verbose=False) if self.enable_llm and self.llm else None
-        )
+    def __init__(self, model: str | None = None) -> None:
+        # Still call BaseAgent for consistency, but this agent no longer relies on the LLM.
+        super().__init__(model=model or "llama3")
 
-    def run(self, input_data: Dict[str, Any]) -> str:
-        """Engage with the user context and return JSON placeholder output."""
-        if self.enable_llm and self.memory:
-            self.memory.clear()
-        LOGGER.info("Starting conversation agent run with context keys: %s", list(input_data.keys()))
-        serialized_context = json.dumps(input_data, default=str)
-        prompt = (
-            "You are the conversation agent for the BankBot Crew onboarding workflow.\n"
-            "Given the prior context, craft a short greeting and list the next information you intend to collect.\n"
-            "Respond ONLY with JSON using keys: greeting, requested_information, notes.\n"
-            f"Context: {serialized_context}"
-        )
-
-        if not self.enable_llm:
-            LOGGER.info("LLM disabled for ConversationAgent; returning scripted response.")
-            return json.dumps(self._fallback_response())
-
-        if not _is_ollama_available(self.base_url):
-            LOGGER.warning("Ollama not reachable; returning fallback conversation response.")
-            return json.dumps(self._fallback_response())
-
-        try:
-            if not self.chain:
-                raise RuntimeError("Conversation chain is not initialised.")
-            response = self.chain.predict(input=prompt)
-            output = response.strip() if isinstance(response, str) else str(response)
-            if not output:
-                raise ValueError("Conversation agent returned an empty string.")
-            LOGGER.debug("Conversation agent raw response: %s", output)
-            return output
-        except Exception as exc:  # pragma: no cover - defensive safety net
-            LOGGER.exception("Conversation agent failed: %s", exc)
-            return json.dumps(self._fallback_response())
+    def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        LOGGER.info("ConversationAgent invoked with keys: %s", list(input_data.keys()))
+        normalized = self._normalise_payload(input_data)
+        LOGGER.debug("ConversationAgent normalised payload with keys: %s", list(normalized.keys()))
+        return normalized
 
     @staticmethod
-    def _fallback_response() -> Dict[str, Any]:
-        return {
-            "greeting": "Hello! I'm here to help with your onboarding.",
-            "requested_information": ["full_name", "date_of_birth", "country"],
-            "notes": "Placeholder conversation response while the AI service initializes.",
-        }
+    def _normalise_payload(payload: Any) -> Dict[str, Any]:
+        """Ensure the downstream agents receive a serialisable dict with basic bookkeeping."""
+        if isinstance(payload, dict):
+            result = dict(payload)
+        elif isinstance(payload, str):
+            try:
+                result = json.loads(payload)
+                if not isinstance(result, dict):
+                    result = {"raw_input": payload}
+            except json.JSONDecodeError:
+                result = {"raw_input": payload}
+        else:
+            result = json.loads(json.dumps(payload, default=str))
+
+        result.setdefault("conversation_timestamp", datetime.utcnow().isoformat())
+        result.setdefault("stage", "conversation_pass_through")
+
+        user_profile = result.get("user_profile")
+        if user_profile and isinstance(user_profile, dict):
+            result["user_profile"] = json.loads(json.dumps(user_profile, default=str))
+
+        if "messages" in result and not isinstance(result.get("messages"), list):
+            result["messages"] = [result["messages"]]
+
+        return result
 
 
 if __name__ == "__main__":
     sample_context = {
         "session_id": "demo-session",
+        "user_profile": {
+            "name": "Jordan",
+            "email": "jordan@example.com",
+        },
         "recent_messages": [
             {"sender": "user", "content": "Hi, I'm interested in opening an account."},
         ],
     }
     agent = ConversationAgent()
-    print(agent.run(sample_context))
-
-
-def _is_ollama_available(base_url: str) -> bool:
-    """Quick health probe for Ollama to avoid blocking when the model is unavailable."""
-    try:
-        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=0.5)
-        return response.ok
-    except requests.RequestException:
-        return False
+    print(json.dumps(agent.run(sample_context), indent=2))

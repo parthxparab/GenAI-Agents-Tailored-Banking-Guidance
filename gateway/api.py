@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Literal
+
 from pydantic import BaseModel, EmailStr, Field
 
 from agents.audit.audit_agent import AuditAgent
@@ -33,6 +35,16 @@ logging.basicConfig(
 )
 
 
+class Questionnaire(BaseModel):
+    """Structured questionnaire responses used by the AdvisorAgent."""
+
+    q1_credit_history: Literal["building", "established"]
+    q2_payment_style: Literal["full_payment", "lower_apr"]
+    q3_cashback: Literal["yes", "no"]
+    q4_travel: Literal["yes", "no"]
+    q5_simple_card: Literal["yes", "no"]
+
+
 class OnboardRequest(BaseModel):
     """Payload submitted by the Streamlit frontend to start onboarding."""
 
@@ -40,9 +52,7 @@ class OnboardRequest(BaseModel):
     email: EmailStr
     income: float = Field(..., gt=0, description="Annual income in numeric form.")
     occupation: str = Field(..., min_length=2)
-    preferences: Optional[str] = Field(
-        None, description="Optional free-form preference notes captured during conversation."
-    )
+    questionnaire: Questionnaire
     document_name: Optional[str] = Field(None, description="Original filename for the uploaded KYC document.")
     document_content: Optional[str] = Field(
         None,
@@ -156,8 +166,9 @@ def _build_conversation_context(request: OnboardRequest, session_id: str) -> Dic
             "name": request.name,
             "email": request.email,
             "income": request.income,
+            "yearly_income": request.income,
             "occupation": request.occupation,
-            "preferences": request.preferences,
+            "questions": request.questionnaire.model_dump(),
         },
         "metadata": {
             "channel": "streamlit",
@@ -236,16 +247,50 @@ def _collect_progress_from_audit(session_id: str) -> Dict[str, str]:
 def _run_workflow_async(session_id: str, request: OnboardRequest) -> None:
     """Execute the CrewAI workflow in the background for the given session."""
     LOGGER.info("Starting workflow for session %s", session_id)
+    current_progress = {
+        "conversation": "in_progress",
+        "kyc": "pending",
+        "advisor": "pending",
+        "audit": "pending",
+    }
+    stage_sequence = ["conversation", "kyc", "advisor", "audit"]
+    stage_map = {
+        "ConversationAgent": "conversation",
+        "KycAgent": "kyc",
+        "AdvisorAgent": "advisor",
+        "AuditAgent": "audit",
+    }
+
+    def _advance_progress(stage_name: str) -> None:
+        key = stage_map.get(stage_name)
+        if not key:
+            return
+        current_progress[key] = "completed"
+        try:
+            idx = stage_sequence.index(key)
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(stage_sequence) - 1:
+            next_stage = stage_sequence[idx + 1]
+            if current_progress.get(next_stage) == "pending":
+                current_progress[next_stage] = "in_progress"
+        try:
+            _update_session(
+                session_id,
+                progress=current_progress.copy(),
+                message=f"{key.title()} stage completed.",
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("Failed to update session progress for stage %s: %s", stage_name, exc)
+
+    def progress_hook(stage_name: str, _payload: Dict[str, Any]) -> None:
+        _advance_progress(stage_name)
+
     _update_session(
         session_id,
         status="running",
         message="CrewAI orchestration in progress.",
-        progress={
-            "conversation": "in_progress",
-            "kyc": "pending",
-            "advisor": "pending",
-            "audit": "pending",
-        },
+        progress=current_progress.copy(),
     )
     _log_api_call("workflow_start", request.model_dump(), session_id, outcome="accepted")
 
@@ -257,6 +302,7 @@ def _run_workflow_async(session_id: str, request: OnboardRequest) -> None:
             conversation_context=conversation_context,
             documents=documents,
             session_id=session_id,
+            progress_callback=progress_hook,
         )
         recommendations = (
             results.get("advisor_result", {}).get("recommendations") if isinstance(results, dict) else None
