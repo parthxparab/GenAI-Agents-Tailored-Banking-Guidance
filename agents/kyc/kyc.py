@@ -1,27 +1,13 @@
-import redis
-import os
-import json
-import time
+from pathlib import Path
+import sys
 
-redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-r = redis.from_url(redis_url)
-pubsub = r.pubsub()
-pubsub.subscribe("kyc")
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parents[2]
+    if str(project_root) not in sys.path:
+        sys.path.append(str(project_root))
 
-def publish_next_step(channel, message):
-    r.publish(channel, json.dumps(message))
+from agents.kyc.kyc_agent import run
 
-print("KYC agent started and listening...")
 
-for message in pubsub.listen():
-    if message['type'] != 'message':
-        continue
-    data = json.loads(message['data'])
-    task_id = data["task_id"]
-    user_id = data["user_id"]
-    step = data.get("step")
-
-    if step == "kyc_start":
-        print(f"KYC: Processing KYC for user {user_id}")
-        time.sleep(2)  # Simulate KYC processing
-        publish_next_step("orchestrator", {"task_id": task_id, "user_id": user_id, "step": "kyc_done"})
+if __name__ == "__main__":
+    run()

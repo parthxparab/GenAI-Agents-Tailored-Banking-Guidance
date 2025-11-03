@@ -12,17 +12,3 @@ Participant Names -
 
 ---
 
-## Repository Structure
-
-| Directory | Purpose |
-|------------|----------|
-| `gateway/` | FastAPI service that acts as the entry point and routes requests to the message queue. |
-| `agents/` | Contains all GenAI agents such as orchestrator, conversation, KYC, advisor, and audit. |
-| `mocks/` | Mock services and datasets for KYC and product recommendation testing. |
-| `frontend/` | Simple React or Streamlit UI for interacting with the system. |
-| `monitoring/` | Prometheus and Grafana configuration files for metrics and dashboards. |
-| `.github/workflows/` | CI/CD pipelines for building and deploying containers. |
-| `.env.example` | Example environment configuration for development. |
-| `docker-compose.yml` | Container orchestration setup for local development. |
-
-Each folder is modular to allow parallel development across team members.

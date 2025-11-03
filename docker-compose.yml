@@ -1,20 +1,46 @@
 version: '3.8'
 
 services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+
   redis:
     image: redis:7
     ports:
       - "6379:6379"
 
+  rq-dashboard:
+    image: eoranged/rq-dashboard
+    ports:
+      - "9181:9181"
+    environment:
+      - RQ_DASHBOARD_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  gateway_worker:
+    build: ./gateway
+    command: ["python", "worker.py"]
+    depends_on:
+      - redis
+      
   gateway:
     build: ./gateway
     ports:
       - "8000:8000"
     depends_on:
       - redis
+    # Share uploaded documents with downstream verifiers.
+    volumes:
+      - uploads:/data/uploads
 
   orchestrator:
-    build: ./agents/orchestrator
+    build: ./orchestrator
     depends_on:
       - redis
     deploy:
@@ -23,27 +49,49 @@ services:
   conversation:
     build: ./agents/conversation
     depends_on:
+      - ollama
       - redis
     deploy:
       replicas: 2
+    environment:
+      - OLLAMA_URL=http://ollama:11434
 
   kyc:
     build: ./agents/kyc
     depends_on:
+      - ollama
       - redis
     deploy:
       replicas: 2
+    volumes:
+      - uploads:/data/uploads
+    environment:
+      - OLLAMA_URL=http://ollama:11434
 
   advisor:
     build: ./agents/advisor
     depends_on:
+      - ollama
       - redis
     deploy:
       replicas: 2
+    environment:
+      - OLLAMA_URL=http://ollama:11434
 
   audit:
     build: ./agents/audit
     depends_on:
+      - ollama
       - redis
     deploy:
       replicas: 1
+    # Persist audit logs for review and demos.
+    volumes:
+      - audit_logs:/data/audit_logs
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+
+volumes:
+  ollama:
+  uploads:
+  audit_logs:

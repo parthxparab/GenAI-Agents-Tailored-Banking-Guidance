@@ -1,25 +1,52 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import redis
-import os
-import json
-import uuid
+import logging
+from logging.config import dictConfig
+from typing import Any, Dict
 
-app = FastAPI()
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-r = redis.from_url(redis_url)
+from routers import advisor, kyc, onboarding, support
+from utils.redis_client import r
 
-class OnboardingRequest(BaseModel):
-    user_id: str
+LOGGING_CONFIG: Dict[str, Any] = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+        },
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+}
 
-@app.post("/start_onboarding")
-async def start_onboarding(request: OnboardingRequest):
-    task_id = str(uuid.uuid4())
-    message = {
-        "task_id": task_id,
-        "user_id": request.user_id,
-        "step": "start"
-    }
-    r.publish("orchestrator", json.dumps(message))
-    return {"message": "Onboarding started", "task_id": task_id}
+dictConfig(LOGGING_CONFIG)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="GenAI Banking API Gateway", version="1.0.0")
+logger.info("Redis client initialised %s", r)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+async def health_check() -> Dict[str, str]:
+    """Simple health check endpoint used by the frontend."""
+    return {"status": "ok"}
+
+
+app.include_router(onboarding.router)
+app.include_router(kyc.router)
+app.include_router(advisor.router)
+app.include_router(support.router)
