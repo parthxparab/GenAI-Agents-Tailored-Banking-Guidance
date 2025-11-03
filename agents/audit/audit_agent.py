@@ -9,28 +9,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-import requests
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-from langchain_community.llms import Ollama
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [AuditAgent] %(message)s")
+from agents.base_agent import BaseAgent
+
 LOGGER = logging.getLogger("audit_agent")
 
 
-class AuditAgent:
-    """Placeholder audit agent that captures an audit trail and summary response."""
+class AuditAgent(BaseAgent):
+    """Captures audit trail snapshots after each workflow stage."""
 
-    def __init__(self, model_name: str = None, log_dir: str | None = None) -> None:
-        self.model_name = model_name or os.getenv("AUDIT_AGENT_MODEL", "llama3")
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.enable_llm = os.getenv("ENABLE_OLLAMA", "false").lower() in {"1", "true", "yes"}
+    def __init__(self, model: str | None = None, log_dir: str | None = None) -> None:
+        super().__init__(model=model or "llama3")
         configured_dir = log_dir or os.getenv("AUDIT_LOG_DIR")
         default_dir = Path(__file__).resolve().parents[2] / "audit_logs"
         self.log_dir = Path(configured_dir) if configured_dir else default_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.llm = Ollama(model=self.model_name, base_url=self.base_url) if self.enable_llm else None
         self.prompt = PromptTemplate(
             input_variables=["session_data"],
             template=(
@@ -40,61 +35,51 @@ class AuditAgent:
                 "Session Data: {session_data}"
             ),
         )
-        self.chain = LLMChain(llm=self.llm, prompt=self.prompt, verbose=False) if self.enable_llm and self.llm else None
+        self.llm_ready = False
+        self.chain: LLMChain | None = None
+        self._initialise_chain()
 
-    def run(self, input_data: Dict[str, Any]) -> str:
-        """Create a placeholder audit summary and append an audit log entry."""
+    def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         session_id = str(
             input_data.get("session_id")
             or input_data.get("task_id")
             or f"session_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         )
-        LOGGER.info("Running audit for session_id=%s", session_id)
+        LOGGER.info("AuditAgent logging session_id=%s", session_id)
         serialized_data = json.dumps(input_data, default=str)
 
         status = "success"
-        output = ""
+        output: Dict[str, Any]
         error_message = None
 
-        if not self.enable_llm:
-            LOGGER.info("LLM disabled for AuditAgent; returning scripted summary.")
+        # Refresh once per call in case the Ollama runtime recovers mid-workflow.
+        self._initialise_chain()
+
+        if not self.llm_ready or not self.chain:
+            LOGGER.info("AuditAgent using fallback summary pathway.")
             status = "degraded"
-            output = json.dumps(
-                {
-                    "summary": "Audit service configured for placeholder mode.",
-                    "verdict": "pending_review",
-                    "next_steps": ["Enable ENABLE_OLLAMA=true to activate AI summaries."],
-                }
-            )
-        elif not _is_ollama_available(self.base_url):
-            LOGGER.warning("Ollama not reachable; returning fallback audit summary.")
-            status = "degraded"
-            output = json.dumps(
-                {
-                    "summary": "Audit service warming up — using placeholder log summary.",
-                    "verdict": "pending_review",
-                    "next_steps": ["Re-run audit once AI services are reachable."],
-                }
-            )
+            output = {
+                "summary": "Audit service configured for placeholder mode.",
+                "verdict": "pending_review",
+                "next_steps": ["Enable ENABLE_OLLAMA=true to activate AI summaries."],
+            }
         else:
             try:
-                if not self.chain:
-                    raise RuntimeError("Audit chain is not initialised.")
                 response = self.chain.invoke({"session_data": serialized_data})
-                output = response.strip() if isinstance(response, str) else str(response)
-                if not output:
-                    raise ValueError("Audit agent returned an empty response.")
-                LOGGER.debug("Audit agent raw response: %s", output)
+                parsed = json.loads(response) if isinstance(response, str) else response
+                if not isinstance(parsed, dict):
+                    raise ValueError("AuditAgent expected dict output from LLM.")
+                output = parsed
+                LOGGER.debug("AuditAgent produced structured audit summary.")
             except Exception as exc:  # pragma: no cover - defensive safety net
                 status = "error"
                 error_message = str(exc)
-                LOGGER.exception("Audit agent failed: %s", exc)
-                fallback = {
+                LOGGER.exception("AuditAgent failed, returning fallback: %s", exc)
+                output = {
                     "summary": "Placeholder audit summary awaiting finalized implementation.",
                     "verdict": "pending_review",
                     "next_steps": ["Escalate to human reviewer once full logic is in place."],
                 }
-                output = json.dumps(fallback)
 
         event = {
             "timestamp": datetime.utcnow().isoformat(),
@@ -102,13 +87,15 @@ class AuditAgent:
             "action": "run",
             "status": status,
             "data_summary": self._summarize_for_log(input_data),
-            "result_preview": self._truncate(output),
+            "result_preview": self._truncate(json.dumps(output, default=str)),
         }
         if error_message:
             event["error"] = error_message
         self._append_audit_event(session_id, event)
 
-        return output
+        enriched = dict(output)
+        enriched.update({"session_id": session_id, "status": status})
+        return enriched
 
     def _append_audit_event(self, session_id: str, event: Dict[str, Any]) -> None:
         log_path = self.log_dir / f"{session_id}.json"
@@ -138,6 +125,18 @@ class AuditAgent:
     def _truncate(text: str, limit: int = 256) -> str:
         return text if len(text) <= limit else f"{text[:limit]}..."
 
+    def _initialise_chain(self) -> None:
+        if self.llm_ready and self.chain:
+            return
+        llm_available = self.is_llm_available(refresh=not self.llm_ready)
+        if not llm_available or not self.llm:
+            self.llm_ready = False
+            self.chain = None
+            return
+        if not self.chain:
+            self.chain = LLMChain(llm=self.llm, prompt=self.prompt, verbose=False)
+        self.llm_ready = True
+
 
 if __name__ == "__main__":
     sample_session = {
@@ -147,12 +146,4 @@ if __name__ == "__main__":
         "advisor_result": {"recommendations": ["Placeholder"]},
     }
     agent = AuditAgent()
-    print(agent.run(sample_session))
-
-
-def _is_ollama_available(base_url: str) -> bool:
-    try:
-        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=0.5)
-        return response.ok
-    except requests.RequestException:
-        return False
+    print(json.dumps(agent.run(sample_session), indent=2))

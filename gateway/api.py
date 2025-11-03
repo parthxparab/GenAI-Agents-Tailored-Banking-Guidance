@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Literal
+
 from pydantic import BaseModel, EmailStr, Field
 
 from agents.audit.audit_agent import AuditAgent
@@ -33,6 +35,16 @@ logging.basicConfig(
 )
 
 
+class Questionnaire(BaseModel):
+    """Structured questionnaire responses used by the AdvisorAgent."""
+
+    q1_credit_history: Literal["building", "established"]
+    q2_payment_style: Literal["full_payment", "lower_apr"]
+    q3_cashback: Literal["yes", "no"]
+    q4_travel: Literal["yes", "no"]
+    q5_simple_card: Literal["yes", "no"]
+
+
 class OnboardRequest(BaseModel):
     """Payload submitted by the Streamlit frontend to start onboarding."""
 
@@ -40,9 +52,7 @@ class OnboardRequest(BaseModel):
     email: EmailStr
     income: float = Field(..., gt=0, description="Annual income in numeric form.")
     occupation: str = Field(..., min_length=2)
-    preferences: Optional[str] = Field(
-        None, description="Optional free-form preference notes captured during conversation."
-    )
+    questionnaire: Questionnaire
     document_name: Optional[str] = Field(None, description="Original filename for the uploaded KYC document.")
     document_content: Optional[str] = Field(
         None,
@@ -156,8 +166,9 @@ def _build_conversation_context(request: OnboardRequest, session_id: str) -> Dic
             "name": request.name,
             "email": request.email,
             "income": request.income,
+            "yearly_income": request.income,
             "occupation": request.occupation,
-            "preferences": request.preferences,
+            "questions": request.questionnaire.model_dump(),
         },
         "metadata": {
             "channel": "streamlit",

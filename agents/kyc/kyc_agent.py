@@ -4,27 +4,21 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any, Dict
 
-import requests
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-from langchain_community.llms import Ollama
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [KycAgent] %(message)s")
+from agents.base_agent import BaseAgent
+
 LOGGER = logging.getLogger("kyc_agent")
 
 
-class KycAgent:
-    """Placeholder KYC agent that prepares a generic verification response."""
+class KycAgent(BaseAgent):
+    """Validates identity data and uploaded documents before advisor processing."""
 
-    def __init__(self, model_name: str = None) -> None:
-        self.model_name = model_name or os.getenv("KYC_AGENT_MODEL", "llama3")
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.enable_llm = os.getenv("ENABLE_OLLAMA", "false").lower() in {"1", "true", "yes"}
-        self.llm = Ollama(model=self.model_name, base_url=self.base_url) if self.enable_llm else None
+    def __init__(self, model: str | None = None) -> None:
+        super().__init__(model=model or "llama3")
         self.prompt = PromptTemplate(
             input_variables=["user_data", "documents"],
             template=(
@@ -35,47 +29,77 @@ class KycAgent:
                 "Documents: {documents}"
             ),
         )
-        self.chain = LLMChain(llm=self.llm, prompt=self.prompt, verbose=False) if self.enable_llm and self.llm else None
+        self.llm_ready = False
+        self.chain: LLMChain | None = None
+        self._initialise_chain()
 
-    def run(self, input_data: Dict[str, Any]) -> str:
-        """Execute the KYC flow with structured input and return placeholder JSON."""
+    def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         user_data = input_data.get("user_data", {})
         documents = input_data.get("documents", [])
-        LOGGER.info("Starting KYC evaluation for user data keys: %s", list(user_data.keys()))
+        documents_summary = self._summarize_documents(documents)
+        LOGGER.info("KycAgent evaluating user data keys: %s", list(user_data.keys()))
 
-        if not self.enable_llm:
-            LOGGER.info("LLM disabled for KycAgent; returning scripted response.")
-            return json.dumps(self._fallback_response())
+        # Refresh the LLM chain on-demand so the agent can recover if Ollama comes online mid-session.
+        self._initialise_chain()
 
-        if not _is_ollama_available(self.base_url):
-            LOGGER.warning("Ollama not reachable; returning fallback KYC response.")
-            return json.dumps(self._fallback_response())
+        if not self.llm_ready or not self.chain:
+            LOGGER.info("KycAgent using fallback response pathway.")
+            return self._fallback_response(documents_summary)
 
         try:
-            if not self.chain:
-                raise RuntimeError("KYC chain is not initialised.")
             response = self.chain.invoke(
                 {
                     "user_data": json.dumps(user_data, default=str),
-                    "documents": json.dumps(documents, default=str),
+                    "documents": json.dumps(documents_summary, default=str),
                 }
             )
-            output = response.strip() if isinstance(response, str) else str(response)
-            if not output:
-                raise ValueError("Received empty response from LLM.")
-            LOGGER.debug("KYC agent raw response: %s", output)
+            output = json.loads(response) if isinstance(response, str) else response
+            if not isinstance(output, dict):
+                raise ValueError("KycAgent expected dict output from LLM.")
+            output.setdefault("documents_reviewed", documents_summary)
+            LOGGER.debug("KycAgent produced structured output.")
             return output
         except Exception as exc:  # pragma: no cover - defensive safety net
-            LOGGER.exception("KYC agent failed: %s", exc)
-            return json.dumps(self._fallback_response())
+            LOGGER.exception("KycAgent failed, returning fallback: %s", exc)
+            return self._fallback_response(documents_summary)
 
     @staticmethod
-    def _fallback_response() -> Dict[str, Any]:
+    def _summarize_documents(documents: Any) -> list[Dict[str, Any]]:
+        summaries = []
+        for item in documents or []:
+            name = str(item.get("name") or "document")
+            content = item.get("content_base64") or ""
+            preview = content[:120] + ("..." if len(content) > 120 else "")
+            summaries.append(
+                {
+                    "name": name,
+                    "received_at": item.get("received_at"),
+                    "size_bytes_est": int(len(content) * 0.75),  # rough base64 decode estimate
+                    "preview": preview,
+                }
+            )
+        return summaries
+
+    @staticmethod
+    def _fallback_response(documents_summary: list[Dict[str, Any]]) -> Dict[str, Any]:
         return {
             "status": "manual_review",
             "confidence": 0.0,
             "notes": "KYC placeholder response while identity validation services are starting up.",
+            "documents_reviewed": documents_summary,
         }
+
+    def _initialise_chain(self) -> None:
+        if self.llm_ready and self.chain:
+            return
+        llm_available = self.is_llm_available(refresh=not self.llm_ready)
+        if not llm_available or not self.llm:
+            self.llm_ready = False
+            self.chain = None
+            return
+        if not self.chain:
+            self.chain = LLMChain(llm=self.llm, prompt=self.prompt, verbose=False)
+        self.llm_ready = True
 
 
 if __name__ == "__main__":
@@ -84,12 +108,4 @@ if __name__ == "__main__":
         "documents": [{"type": "passport", "reference": "sample-passport-id"}],
     }
     agent = KycAgent()
-    print(agent.run(sample_input))
-
-
-def _is_ollama_available(base_url: str) -> bool:
-    try:
-        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=0.5)
-        return response.ok
-    except requests.RequestException:
-        return False
+    print(json.dumps(agent.run(sample_input), indent=2))

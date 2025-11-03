@@ -14,7 +14,9 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - ENABLE_OLLAMA=true
       - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_URL=http://ollama:11434
       - LOG_LEVEL=INFO
     volumes:
       - audit_logs:/app/audit_logs
@@ -30,6 +32,7 @@ services:
       - "8501:8501"
     environment:
       - GATEWAY_URL=http://gateway:8000
+      - STATUS_POLL_INTERVAL=60
     depends_on:
       - gateway
     restart: unless-stopped

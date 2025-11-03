@@ -7,7 +7,7 @@ import logging
 import os
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import requests
 from crewai import Agent as CrewAgent
@@ -40,10 +40,10 @@ class BankBotOrchestrator:
         )
 
         # Instantiate operational agents.
-        self.conversation_agent = ConversationAgent(model_name=self.model_name)
-        self.kyc_agent = KycAgent(model_name=self.model_name)
-        self.advisor_agent = AdvisorAgent(model_name=self.model_name)
-        self.audit_agent = AuditAgent(model_name=self.model_name)
+        self.conversation_agent = ConversationAgent(model=self.model_name)
+        self.kyc_agent = KycAgent(model=self.model_name)
+        self.advisor_agent = AdvisorAgent(model=self.model_name)
+        self.audit_agent = AuditAgent(model=self.model_name)
 
         # Runtime state container populated per workflow run.
         self._session_state: Dict[str, Any] = {}
@@ -151,14 +151,30 @@ class BankBotOrchestrator:
         context = self._ensure_dict(conversation_context)
         result_raw = self.conversation_agent.run(context)
         result = self._ensure_dict(result_raw)
+        if "questions" not in result:
+            questions = self._session_state.get("user_input", {}).get("questions")
+            if questions:
+                result["questions"] = questions
         self._session_state["conversation_result"] = result
+        self._session_state["conversation_summary"] = self._derive_conversation_summary(result)
         self._record_audit_event("ConversationAgent", context, result)
         return json.dumps(result)
 
     def _run_kyc_step(self, _: Any = None) -> str:
+        documents_raw = self._session_state.get("documents", [])
+        documents_summary = self.kyc_agent._summarize_documents(documents_raw)
+        user_input = self._session_state.get("user_input", {})
+        if not isinstance(user_input, dict):
+            user_input = {}
+        conversation_details = self._ensure_dict(self._session_state.get("conversation_result"))
+        if not isinstance(conversation_details, dict):
+            conversation_details = {}
         payload = {
-            "user_data": self._session_state.get("conversation_result", {}),
-            "documents": self._session_state.get("documents", []),
+            "user_data": {
+                **user_input,
+                **conversation_details,
+            },
+            "documents": documents_summary,
         }
         result_raw = self.kyc_agent.run(payload)
         result = self._ensure_dict(result_raw)
@@ -167,9 +183,36 @@ class BankBotOrchestrator:
         return json.dumps(result)
 
     def _run_advisor_step(self, _: Any = None) -> str:
+        user_input = self._session_state.get("user_input", {}) or {}
+        if not isinstance(user_input, dict):
+            user_input = {}
+        yearly_income = (
+            user_input.get("yearly_income")
+            if user_input.get("yearly_income") is not None
+            else user_input.get("income")
+        )
+        if yearly_income is None:
+            yearly_income = 0
+        try:
+            yearly_income_value = float(yearly_income)
+        except (TypeError, ValueError):
+            yearly_income_value = 0.0
+        questions = user_input.get("questions", {})
+        if not isinstance(questions, dict):
+            questions = {}
+        conversation_details = self._ensure_dict(self._session_state.get("conversation_result"))
+        if not isinstance(conversation_details, dict):
+            conversation_details = {}
+        kyc_result = self._ensure_dict(self._session_state.get("kyc_result"))
+        if not isinstance(kyc_result, dict):
+            kyc_result = {}
         payload = {
-            "user_profile": self._session_state.get("conversation_result", {}),
-            "kyc_result": self._session_state.get("kyc_result", {}),
+            "case_id": self._session_state.get("session_id"),
+            "address": user_input.get("address"),
+            "yearly_income": yearly_income_value,
+            "questions": questions,
+            "user_profile": conversation_details,
+            "kyc_result": kyc_result,
         }
         result_raw = self.advisor_agent.run(payload)
         result = self._ensure_dict(result_raw)
@@ -189,28 +232,43 @@ class BankBotOrchestrator:
     ) -> Dict[str, Any]:
         """Kick off the CrewAI workflow and return aggregated results."""
         resolved_session_id = session_id or str(uuid.uuid4())
+        sanitized_context = self._ensure_dict(conversation_context)
+        sanitized_documents = documents or []
+        if not isinstance(sanitized_documents, list):
+            sanitized_documents = [sanitized_documents]
+        user_profile_raw = sanitized_context.get("user_profile", {}) if isinstance(sanitized_context, dict) else {}
+        user_profile = user_profile_raw if isinstance(user_profile_raw, dict) else {}
         self._session_state = {
             "session_id": resolved_session_id,
-            "conversation_context": conversation_context,
-            "documents": documents or [],
+            "conversation_context": sanitized_context,
+            "documents": sanitized_documents,
             "conversation_result": None,
             "kyc_result": None,
             "advisor_result": None,
+            "conversation_summary": None,
+            "audit_summaries": [],
+            "user_input": user_profile,
         }
+        # The orchestrator always flows data sequentially: Conversation -> KYC -> Advisor -> Audit.
+        # Each stage stores its structured output back into _session_state so downstream agents
+        # receive a consistent dictionary when they execute.
 
         if not self._use_llm or not self.crew:
             LOGGER.info("Executing fallback workflow for session %s (LLM disabled or unavailable).", resolved_session_id)
+            # When Ollama is offline we short-circuit the CrewAI stack and execute agents sequentially.
             results = self._run_fallback_workflow()
             return results
 
-        # CrewAI currently runs tasks in-memory; to scale horizontally we can enqueue
-        # the payload to Redis/RQ or Celery here before invoking kickoff.
         inputs = {
             "session_id": resolved_session_id,
-            "conversation_context": json.dumps(conversation_context, default=str),
+            "conversation_context": json.dumps(sanitized_context, default=str),
         }
         LOGGER.info("Launching workflow for session %s", resolved_session_id)
-        self.crew.kickoff(inputs=inputs)
+        try:
+            self.crew.kickoff(inputs=inputs)
+        except Exception as exc:
+            LOGGER.exception("Crew execution failed for session %s; falling back to sequential run: %s", resolved_session_id, exc)
+            return self._run_fallback_workflow()
 
         # Record a final audit snapshot combining all outcomes.
         self._record_audit_event(
@@ -224,13 +282,41 @@ class BankBotOrchestrator:
         """Prepare structured output for the Streamlit frontend."""
         session_id = self._session_state.get("session_id")
         audit_log_path = self.audit_agent.log_dir / f"{session_id}.json"
+        logs: List[Any] = []
+        if audit_log_path.exists():
+            try:
+                logs = json.loads(audit_log_path.read_text())
+            except json.JSONDecodeError:
+                LOGGER.warning("Audit log for %s is not valid JSON; returning empty logs.", session_id)
+
+        conversation_result = self._ensure_dict(self._session_state.get("conversation_result"))
+        if not isinstance(conversation_result, dict):
+            conversation_result = {}
+        advisor_result = self._ensure_dict(self._session_state.get("advisor_result"))
+        if not isinstance(advisor_result, dict):
+            advisor_result = {}
+        kyc_result = self._ensure_dict(self._session_state.get("kyc_result"))
+        if not isinstance(kyc_result, dict):
+            kyc_result = {}
+        conversation_summary = self._session_state.get("conversation_summary") or self._derive_conversation_summary(
+            conversation_result
+        )
+        recommendations = advisor_result.get("recommendations", [])
+
         final_payload = {
             "session_id": session_id,
-            "conversation_result": self._session_state.get("conversation_result"),
-            "kyc_result": self._session_state.get("kyc_result"),
-            "advisor_result": self._session_state.get("advisor_result"),
+            "conversation_summary": conversation_summary,
+            "kyc_status": kyc_result.get("status"),
+            "recommendations": recommendations if isinstance(recommendations, list) else [],
             "audit_log_path": str(audit_log_path),
-            "generated_at": datetime.utcnow().isoformat(),
+            "timestamp": datetime.utcnow().isoformat(),
+            "conversation_result": conversation_result,
+            "user_profile": self._session_state.get("user_input"),
+            "advisor_result": advisor_result,
+            "kyc_result": kyc_result,
+            "logs": logs,
+            "audit_events": logs,
+            "audit_summaries": self._session_state.get("audit_summaries", []),
         }
         LOGGER.info("Aggregated workflow results for session %s", session_id)
         return final_payload
@@ -239,18 +325,39 @@ class BankBotOrchestrator:
         """Run a lightweight placeholder workflow when LLMs are disabled."""
         context = self._ensure_dict(self._session_state.get("conversation_context", {}))
         conversation_result = self._ensure_dict(self.conversation_agent.run(context))
+        if "questions" not in conversation_result:
+            questions = self._session_state.get("user_input", {}).get("questions")
+            if questions:
+                conversation_result["questions"] = questions
         self._session_state["conversation_result"] = conversation_result
+        self._session_state["conversation_summary"] = self._derive_conversation_summary(conversation_result)
         self._record_audit_event("ConversationAgent", context, conversation_result)
 
         kyc_payload = {
-            "user_data": conversation_result,
+            "user_data": {
+                **self._session_state.get("user_input", {}),
+                **conversation_result,
+            },
             "documents": self._session_state.get("documents", []),
         }
         kyc_result = self._ensure_dict(self.kyc_agent.run(kyc_payload))
         self._session_state["kyc_result"] = kyc_result
         self._record_audit_event("KycAgent", kyc_payload, kyc_result)
 
-        advisor_payload = {"user_profile": conversation_result, "kyc_result": kyc_result}
+        user_input = self._session_state.get("user_input", {}) or {}
+        yearly_income = (
+            user_input.get("yearly_income")
+            if user_input.get("yearly_income") is not None
+            else user_input.get("income")
+        )
+        advisor_payload = {
+            "case_id": self._session_state.get("session_id"),
+            "address": user_input.get("address"),
+            "yearly_income": yearly_income,
+            "questions": user_input.get("questions", {}),
+            "user_profile": conversation_result,
+            "kyc_result": kyc_result,
+        }
         advisor_result = self._ensure_dict(self.advisor_agent.run(advisor_payload))
         self._session_state["advisor_result"] = advisor_result
         self._record_audit_event("AdvisorAgent", advisor_payload, advisor_result)
@@ -266,7 +373,24 @@ class BankBotOrchestrator:
     # Utility helpers
     # ------------------------------------------------------------------
 
+    def _derive_conversation_summary(self, conversation_result: Dict[str, Any]) -> str:
+        """Condense conversation agent output so downstream consumers get a quick snapshot."""
+        if not conversation_result:
+            return "No conversation data collected."
+        notes = conversation_result.get("notes")
+        if isinstance(notes, str) and notes.strip():
+            return notes.strip()
+        greeting = conversation_result.get("greeting")
+        if isinstance(greeting, str) and greeting.strip():
+            return greeting.strip()
+        try:
+            serialized = json.dumps(conversation_result, default=str)
+        except (TypeError, ValueError):
+            serialized = str(conversation_result)
+        return serialized[:280]
+
     def _record_audit_event(self, stage: str, input_payload: Any, result_payload: Any) -> None:
+        # AuditAgent persists a JSON timeline so downstream services can inspect progress.
         audit_payload = {
             "session_id": self._session_state.get("session_id"),
             "stage": stage,
@@ -275,7 +399,8 @@ class BankBotOrchestrator:
             "timestamp": datetime.utcnow().isoformat(),
         }
         try:
-            self.audit_agent.run(audit_payload)
+            audit_snapshot = self.audit_agent.run(audit_payload)
+            self._session_state.setdefault("audit_summaries", []).append(audit_snapshot)
         except Exception as exc:  # pragma: no cover - defensive logging
             LOGGER.exception("Audit logging failed for stage %s: %s", stage, exc)
 
@@ -321,35 +446,6 @@ def _is_ollama_available(base_url: str) -> bool:
     except requests.RequestException:
         return False
 
-    # ------------------------------------------------------------------
-    # Scaling guidance
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def crewai_handles_current_scale(concurrent_sessions: int = 5) -> bool:
-        """Heuristic decision helper for whether CrewAI's scheduler is sufficient."""
-        # CrewAI coordinates tasks in-process; for light workloads (< ~10 concurrent sessions)
-        # this is typically adequate when paired with Ollama's local model hosting.
-        return concurrent_sessions <= 10
-
-    @staticmethod
-    def outline_redis_integration() -> Dict[str, str]:
-        """Provide guidance on plugging Redis or RabbitMQ into the orchestration pipeline."""
-        return {
-            "recommended_trigger": "Dispatch BankBotOrchestrator.run_workflow via a Celery or RQ worker.",
-            "queue_payload": "Serialize session_id, conversation_context, and document metadata to JSON.",
-            "result_store": "Persist final aggregates to Redis hashes or a document DB for Streamlit retrieval.",
-            "code_hook": "Insert enqueue/dequeue logic where run_workflow currently calls crew.kickoff.",
-        }
-
-
-SCALING_NOTES = (
-    "CrewAI's in-memory sequential process comfortably manages a handful of concurrent sessions when Ollama "
-    "serves local LLaMA models. Introduce a Redis- or RabbitMQ-backed task queue once throughput grows past "
-    "approximately 10–15 parallel onboarding flows, or when orchestrator uptime must persist across multiple "
-    "host instances."
-)
-
 
 if __name__ == "__main__":
     dummy_context = {
@@ -362,4 +458,3 @@ if __name__ == "__main__":
     orchestrator = BankBotOrchestrator()
     results = orchestrator.run_workflow(conversation_context=dummy_context, documents=[{"type": "passport"}])
     print(json.dumps(results, indent=2))
-    print("\nScaling guidance:", SCALING_NOTES)
