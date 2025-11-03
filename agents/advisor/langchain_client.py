@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from langchain_community.chat_models import ChatOllama
+from langchain_ollama import ChatOllama
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.language_models.base import BaseLanguageModel
 
 logger = logging.getLogger("langchain_client")
 
-OLLAMA_URL = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 DEFAULT_MODEL = os.getenv("ADVISOR_LLM_MODEL", "llama3")
 RECOMMENDATION_COUNT = int(os.getenv("ADVISOR_RECOMMENDATIONS", "3"))
 
@@ -98,25 +98,19 @@ def _filter_eligible_cards(cards: List[Dict[str, str]], yearly_income: float) ->
     return eligible if eligible else cards  # Return all if none eligible (fallback)
 
 
-def get_credit_card_recommendations(
-    user_data: Dict[str, Any],
-    cards: List[Dict[str, str]],
-    llm: Optional[BaseLanguageModel] = None,
-    recommendation_count: Optional[int] = None,
-) -> Dict[str, Any]:
+def get_credit_card_recommendations(user_data: Dict[str, Any], cards: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Get credit card recommendations using LangChain with Ollama.
+    Get credit card recommendations using Langchain with Ollama.
 
     Args:
-        user_data: Dictionary containing case_id, address, yearly_income, and questions.
-        cards: List of available credit cards from credit_cards.py.
-        llm: Optional LangChain-compatible LLM (used to avoid re-instantiation).
-        recommendation_count: Optional override for number of recommendations to request.
+        user_data: Dictionary containing case_id, address, yearly_income, and questions
+        cards: List of available credit cards from credit_cards.py
 
     Returns:
-        Dictionary with a validated recommendations list.
+        Dictionary with recommendations list
     """
     try:
+        # Extract user data
         case_id = user_data.get("case_id", "unknown")
         address = user_data.get("address", "")
         yearly_income = float(user_data.get("yearly_income", 0))
@@ -128,104 +122,76 @@ def get_credit_card_recommendations(
         q4_travel = questions.get("q4_travel", "")
         q5_simple_card = questions.get("q5_simple_card", "")
 
-        target_count = recommendation_count or RECOMMENDATION_COUNT
-
+        # Filter cards by income eligibility
         eligible_cards = _filter_eligible_cards(cards, yearly_income)
         cards_json = json.dumps(eligible_cards, indent=2)
 
+        # Read model and URL dynamically (in case they were updated after import)
         model = os.getenv("ADVISOR_LLM_MODEL", DEFAULT_MODEL)
-        ollama_url = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", OLLAMA_URL)
+        ollama_url = os.getenv("OLLAMA_URL", OLLAMA_URL)
+        
+        logger.info("Using model: %s, URL: %s", model, ollama_url)
+        
+        # Initialize LLM
+        llm = ChatOllama(
+            model=model,
+            base_url=ollama_url,
+            temperature=0.7,
+        )
 
-        if llm is None:
-            logger.info("Initializing ChatOllama for AdvisorAgent with model=%s url=%s", model, ollama_url)
-            llm = ChatOllama(
-                model=model,
-                base_url=ollama_url,
-                temperature=0.7,
-            )
+        # Create parser
+        parser = JsonOutputParser()
 
-        prompt = _build_prompt_template().partial(recommendation_count=target_count)
+        # Build chain
+        prompt = _build_prompt_template()
+        chain = prompt | llm | parser
 
-        inputs = {
-            "case_id": case_id,
-            "address": address,
-            "yearly_income": yearly_income,
-            "q1_credit_history": q1_credit_history,
-            "q2_payment_style": q2_payment_style,
-            "q3_cashback": q3_cashback,
-            "q4_travel": q4_travel,
-            "q5_simple_card": q5_simple_card,
-            "available_cards": cards_json,
-        }
+        # Invoke chain
+        logger.info("Invoking Langchain chain for case_id=%s", case_id)
+        response = chain.invoke(
+            {
+                "case_id": case_id,
+                "address": address,
+                "yearly_income": yearly_income,
+                "q1_credit_history": q1_credit_history,
+                "q2_payment_style": q2_payment_style,
+                "q3_cashback": q3_cashback,
+                "q4_travel": q4_travel,
+                "q5_simple_card": q5_simple_card,
+                "available_cards": cards_json,
+                "recommendation_count": RECOMMENDATION_COUNT,
+            }
+        )
 
-        logger.info("Invoking ChatOllama for case_id=%s", case_id)
-        messages = prompt.format_messages(**inputs)
-        raw_response = llm.invoke(messages)
-        text_response = getattr(raw_response, "content", str(raw_response))
-        response = _coerce_json(text_response)
+        # Validate response structure
+        if not isinstance(response, dict):
+            raise ValueError(f"Expected dict response, got {type(response)}")
 
         recommendations = response.get("recommendations", [])
         if not isinstance(recommendations, list):
-            raise ValueError("Recommendations must be provided as a list of objects.")
+            raise ValueError("Recommendations must be a list")
 
+        # Validate card names exist in provided cards
         card_names = {card["card_name"] for card in cards}
         validated_recommendations = []
-        for rec in recommendations[:target_count]:
+        for rec in recommendations[:RECOMMENDATION_COUNT]:
             card_name = rec.get("card_name", "")
             if card_name in card_names:
                 validated_recommendations.append(rec)
             else:
                 logger.warning("Recommended card '%s' not found in available cards", card_name)
 
-        if len(validated_recommendations) < target_count:
+        if len(validated_recommendations) < RECOMMENDATION_COUNT:
             logger.warning(
                 "Only %d valid recommendations found, expected %d",
                 len(validated_recommendations),
-                target_count,
+                RECOMMENDATION_COUNT,
             )
 
         return {"recommendations": validated_recommendations}
 
     except Exception as exc:
-        logger.error("Error in LangChain recommendation: %s", exc, exc_info=True)
+        logger.error("Error in Langchain recommendation: %s", exc, exc_info=True)
         raise
 
 
-def _coerce_json(raw_text: str) -> Dict[str, Any]:
-    """Best-effort extraction of JSON from LLM output."""
-    import re
-
-    if not raw_text:
-        raise ValueError("Empty response from LLM.")
-
-    candidates: List[str] = []
-
-    fenced = re.findall(r"```json\\s*(.*?)```", raw_text, re.DOTALL | re.IGNORECASE)
-    if fenced:
-        candidates.extend(fenced)
-
-    start = raw_text.find("{")
-    end = raw_text.rfind("}")
-    if start != -1 and end != -1 and start < end:
-        candidates.append(raw_text[start : end + 1])
-
-    errors: List[str] = []
-    for snippet in candidates:
-        try:
-            return json.loads(snippet)
-        except json.JSONDecodeError as exc:
-            errors.append(str(exc))
-
-    # Attempt to remove leading commentary lines and retry.
-    cleaned_lines = []
-    for line in raw_text.splitlines():
-        if line.strip().startswith("//"):
-            continue
-        cleaned_lines.append(line)
-    cleaned_text = "\n".join(cleaned_lines)
-    try:
-        return json.loads(cleaned_text)
-    except json.JSONDecodeError as exc:
-        errors.append(str(exc))
-
-    raise ValueError(f"Unable to parse LLM response as JSON. Errors: {errors}. Raw output: {raw_text[:2000]}")

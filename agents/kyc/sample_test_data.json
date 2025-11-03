@@ -1,0 +1,8 @@
+{
+  "name": "Jane Sample",
+  "address": "1 Anywhere St. Regina, SK S4P 2N7",
+  "date_of_birth": "1988-08-15",
+  "driver_license_image": "",
+  "note": "Set driver_license_image to base64 string or use --image-file when running test script. Test data matches Saskatchewan driver's license specimen."
+}
+

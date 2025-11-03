@@ -1,0 +1,114 @@
+nameOverride: ""
+
+imageDefaults:
+  registry: ""
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+redis:
+  image:
+    repository: redis
+    tag: "7"
+    pullPolicy: IfNotPresent
+  service:
+    port: 6379
+  resources: {}
+  persistence:
+    enabled: false
+    size: 1Gi
+
+components:
+  gateway:
+    enabled: true
+    image:
+      repository: "REPLACE_WITH_ECR/gateway"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    containerPort: 8000
+    service:
+      enabled: true
+      type: LoadBalancer
+      port: 8000
+      targetPort: 8000
+    env: []
+    resources: {}
+  orchestrator:
+    enabled: true
+    image:
+      repository: "REPLACE_WITH_ECR/orchestrator"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    containerPort: 8000
+    service:
+      enabled: false
+      type: ClusterIP
+      port: 8000
+      targetPort: 8000
+    env: []
+    resources: {}
+  conversation:
+    enabled: true
+    image:
+      repository: "REPLACE_WITH_ECR/conversation"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    replicas: 2
+    containerPort: 8000
+    service:
+      enabled: false
+      type: ClusterIP
+      port: 8000
+      targetPort: 8000
+    env: []
+    resources: {}
+  kyc:
+    enabled: true
+    image:
+      repository: "REPLACE_WITH_ECR/kyc"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    replicas: 2
+    containerPort: 8000
+    service:
+      enabled: false
+      type: ClusterIP
+      port: 8000
+      targetPort: 8000
+    env: []
+    resources: {}
+  advisor:
+    enabled: true
+    image:
+      repository: "REPLACE_WITH_ECR/advisor"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    replicas: 2
+    containerPort: 8000
+    service:
+      enabled: false
+      type: ClusterIP
+      port: 8000
+      targetPort: 8000
+    env: []
+    resources: {}
+  audit:
+    enabled: true
+    image:
+      repository: "REPLACE_WITH_ECR/audit"
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    containerPort: 8000
+    service:
+      enabled: false
+      type: ClusterIP
+      port: 8000
+      targetPort: 8000
+    env: []
+    resources: {}
+
+affinity: {}
+nodeSelector: {}
+tolerations: []
