@@ -24,9 +24,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
     from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 API_BASE_URL = os.getenv("GATEWAY_URL", "http://localhost:8000")
-REQUEST_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
-STATUS_POLL_INTERVAL = float(os.getenv("STATUS_POLL_INTERVAL", 60))
-STATUS_POLL_TIMEOUT = int(os.getenv("STATUS_POLL_TIMEOUT", "120"))
+REQUEST_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", 1800))
+# Poll every few seconds so UI reflects backend progress promptly.
+STATUS_POLL_INTERVAL = float(os.getenv("STATUS_POLL_INTERVAL", 5))
+STATUS_POLL_TIMEOUT = int(os.getenv("STATUS_POLL_TIMEOUT", 600))
 STAGE_ORDER = ["conversation", "kyc", "advisor", "audit"]
 
 st.set_page_config(page_title="BankBot Crew Onboarding", page_icon="🏦", layout="centered")

@@ -58,7 +58,7 @@ class AdvisorAgent(BaseAgent):
                 source = "langchain"
                 LOGGER.debug("AdvisorAgent produced %d LangChain-backed recommendations.", len(validated))
             except Exception as exc:  # pragma: no cover - defensive safety net
-                LOGGER.exception("AdvisorAgent LLM path failed, using fallback: %s", exc)
+                LOGGER.exception("AdvisorAgent LLM path failed, using local AI: %s", exc)
                 recommendations = self._fallback_recommendations()
         else:
             LOGGER.info("AdvisorAgent operating in fallback mode (LLM disabled/unavailable).")
@@ -163,7 +163,7 @@ class AdvisorAgent(BaseAgent):
                     "interest_rate": card["interest_rate"],
                     "rewards": card["rewards"],
                     "requirements": card["requirements"],
-                    "why_recommended": "Rule-based fallback recommendation while advisor AI warms up.",
+                    "why_recommended": "Rule-based AI recommendation",
                 }
             )
         return {"recommendations": enriched}

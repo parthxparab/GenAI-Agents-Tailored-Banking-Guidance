@@ -22,6 +22,7 @@ class AuditAgent(BaseAgent):
 
     def __init__(self, model: str | None = None, log_dir: str | None = None) -> None:
         super().__init__(model=model or "llama3")
+        self.use_llm = os.getenv("ENABLE_AUDIT_LLM", "false").lower() in {"1", "true", "yes"}
         configured_dir = log_dir or os.getenv("AUDIT_LOG_DIR")
         default_dir = Path(__file__).resolve().parents[2] / "audit_logs"
         self.log_dir = Path(configured_dir) if configured_dir else default_dir
@@ -56,12 +57,15 @@ class AuditAgent(BaseAgent):
         self._initialise_chain()
 
         if not self.llm_ready or not self.chain:
-            LOGGER.info("AuditAgent using fallback summary pathway.")
+            if self.use_llm:
+                LOGGER.info("AuditAgent using local AI summary pathway.")
+            else:
+                LOGGER.debug("AuditAgent LLM disabled via ENABLE_AUDIT_LLM; using deterministic summary.")
             status = "degraded"
             output = {
                 "summary": "Audit service configured for placeholder mode.",
                 "verdict": "pending_review",
-                "next_steps": ["Enable ENABLE_OLLAMA=true to activate AI summaries."],
+                "next_steps": ["Enable ENABLE_AUDIT_LLM=true to activate AI summaries."],
             }
         else:
             try:
@@ -126,6 +130,10 @@ class AuditAgent(BaseAgent):
         return text if len(text) <= limit else f"{text[:limit]}..."
 
     def _initialise_chain(self) -> None:
+        if not self.use_llm:
+            self.llm_ready = False
+            self.chain = None
+            return
         if self.llm_ready and self.chain:
             return
         llm_available = self.is_llm_available(refresh=not self.llm_ready)

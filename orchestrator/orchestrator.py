@@ -8,14 +8,9 @@ import os
 import uuid
 from datetime import datetime
 import time
-from typing import Any, Dict, Optional, List
+from typing import Any, Callable, Dict, Optional, List
 
 import requests
-from crewai import Agent as CrewAgent
-from crewai import Crew, Process, Task
-from langchain_core.language_models.llms import LLM
-from langchain_core.tools import Tool
-from langchain_community.llms import Ollama
 
 from agents.advisor.advisor_agent import AdvisorAgent
 from agents.audit.audit_agent import AuditAgent
@@ -35,12 +30,9 @@ class BankBotOrchestrator:
         self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self.enable_llm = os.getenv("ENABLE_OLLAMA", "false").lower() in {"1", "true", "yes"}
         self._ollama_available = _is_ollama_available(self.ollama_base_url) if self.enable_llm else False
-        self._use_llm = self.enable_llm and self._ollama_available
-        self.llm = (
-            Ollama(model=self.model_name, base_url=self.ollama_base_url) if self._use_llm else _FallbackPlannerLLM()
-        )
+        if not self._ollama_available and self.enable_llm:
+            LOGGER.warning("Ollama endpoint %s is unreachable; agents will use deterministic fallbacks.", self.ollama_base_url)
 
-        # Instantiate operational agents.
         self.conversation_agent = ConversationAgent(model=self.model_name)
         self.kyc_agent = KycAgent(model=self.model_name)
         self.advisor_agent = AdvisorAgent(model=self.model_name)
@@ -48,215 +40,6 @@ class BankBotOrchestrator:
 
         # Runtime state container populated per workflow run.
         self._session_state: Dict[str, Any] = {}
-
-        # Wrap the LangChain agents as CrewAI tools so Crew processes can invoke them.
-        self._conversation_tool = Tool(
-            name="ConversationAgentTool",
-            func=self._run_conversation_step,
-            description="Collect structured onboarding details from the user context.",
-        )
-        self._kyc_tool = Tool(
-            name="KycAgentTool",
-            func=self._run_kyc_step,
-            description="Validate identity data and documents gathered during onboarding.",
-        )
-        self._advisor_tool = Tool(
-            name="AdvisorAgentTool",
-            func=self._run_advisor_step,
-            description="Generate placeholder banking product recommendations.",
-        )
-
-        # Register CrewAI-facing personas for coordination. These use the shared Ollama model
-        # for high-level planning while delegating execution to the wrapped tools.
-        self._conversation_crewai_agent = CrewAgent(
-            role="Onboarding Conversation Specialist",
-            goal="Gather accurate, structured onboarding data to kick off KYC.",
-            backstory=(
-                "You welcome new customers, record their basic details, and ensure the session "
-                "is ready for automated KYC verification."
-            ),
-            tools=[self._conversation_tool],
-            allow_delegation=False,
-            verbose=False,
-            llm=self.llm,
-        )
-        self._kyc_crewai_agent = CrewAgent(
-            role="Digital KYC Analyst",
-            goal="Assess provided documents and return a placeholder verification result.",
-            backstory="You confirm KYC readiness before the advisor formulates offers.",
-            tools=[self._kyc_tool],
-            allow_delegation=False,
-            verbose=False,
-            llm=self.llm,
-        )
-        self._advisor_crewai_agent = CrewAgent(
-            role="Product Advisor",
-            goal="Draft provisional credit-card guidance based on verified data.",
-            backstory="You sketch product options so a human banker can follow up quickly.",
-            tools=[self._advisor_tool],
-            allow_delegation=False,
-            verbose=False,
-            llm=self.llm,
-        )
-
-        # Tasks reference the session payload which is supplied during kickoff.
-        self._conversation_task = Task(
-            description=(
-                "Use ConversationAgentTool to collect onboarding details for session {{session_id}}. "
-                "Input payload: {{conversation_context}}"
-            ),
-            agent=self._conversation_crewai_agent,
-            expected_output="JSON containing greeting, requested_information, and notes.",
-        )
-        self._kyc_task = Task(
-            description=(
-                "Execute KycAgentTool with the structured data produced earlier for session {{session_id}}. "
-                "Ensure the output includes status, confidence, and notes."
-            ),
-            agent=self._kyc_crewai_agent,
-            expected_output="JSON containing status, confidence, and notes.",
-        )
-        self._advisor_task = Task(
-            description=(
-                "Run AdvisorAgentTool to propose placeholder credit card recommendations for session {{session_id}}. "
-                "Include a rationale string in the JSON output."
-            ),
-            agent=self._advisor_crewai_agent,
-            expected_output="JSON containing recommendations and rationale.",
-        )
-
-        # Assemble a sequential crew when LLM-powered workflows are enabled.
-        if self._use_llm:
-            self.crew = Crew(
-                agents=[
-                    self._conversation_crewai_agent,
-                    self._kyc_crewai_agent,
-                    self._advisor_crewai_agent,
-                ],
-                tasks=[
-                    self._conversation_task,
-                    self._kyc_task,
-                    self._advisor_task,
-                ],
-                process=Process.sequential,
-                verbose=False,
-            )
-        else:
-            self.crew = None
-
-    # ------------------------------------------------------------------
-    # Tool wrappers executed by Crew tasks. Each wrapper logs via AuditAgent.
-    # ------------------------------------------------------------------
-
-    def _run_conversation_step(self, conversation_context: Any) -> str:
-        start_time = time.time()
-        context = self._ensure_dict(conversation_context)
-        # CrewAI occasionally supplies the JSON schema for the tool instead of the payload or wraps the payload
-        # under a request envelope. Detect those shapes and recover the real session context we stored earlier.
-        original_context = context
-        for _ in range(5):
-            if context.get("type") == "object" and ("properties" in context or "required" in context):
-                LOGGER.debug("Recovered conversation payload from session state (schema received).")
-                context = self._ensure_dict(self._session_state.get("conversation_context", {}))
-                continue
-            if "request" in context and "session_id" not in context:
-                request_payload = context.get("request")
-                recovered = self._ensure_dict(request_payload)
-                if "raw_output" in recovered and len(recovered) == 1:
-                    LOGGER.debug("Discarded wrapper request payload; using stored conversation context.")
-                    context = self._ensure_dict(self._session_state.get("conversation_context", {}))
-                    continue
-                LOGGER.debug("Unwrapped conversation payload from request wrapper.")
-                context = recovered
-                continue
-            break
-        else:
-            LOGGER.warning("ConversationAgent input exceeded unwrap attempts; falling back to stored payload.")
-            context = self._ensure_dict(self._session_state.get("conversation_context", {}))
-
-        if (
-            context is original_context
-            and "session_id" not in context
-            and "user_profile" not in context
-            and "recent_messages" not in context
-        ):
-            LOGGER.warning("ConversationAgent received unexpected payload shape; using stored conversation context.")
-            context = self._ensure_dict(self._session_state.get("conversation_context", {}))
-        result_raw = self.conversation_agent.run(context)
-        result = self._ensure_dict(result_raw)
-        if "questions" not in result:
-            questions = self._session_state.get("user_input", {}).get("questions")
-            if questions:
-                result["questions"] = questions
-        self._session_state["conversation_result"] = result
-        self._session_state["conversation_summary"] = self._derive_conversation_summary(result)
-        self._record_audit_event("ConversationAgent", context, result)
-        self._record_performance("ConversationAgent", time.time() - start_time)
-        return json.dumps(result)
-
-    def _run_kyc_step(self, _: Any = None) -> str:
-        start_time = time.time()
-        documents_raw = self._session_state.get("documents", [])
-        documents_summary = self.kyc_agent._summarize_documents(documents_raw)
-        user_input = self._session_state.get("user_input", {})
-        if not isinstance(user_input, dict):
-            user_input = {}
-        conversation_details = self._ensure_dict(self._session_state.get("conversation_result"))
-        if not isinstance(conversation_details, dict):
-            conversation_details = {}
-        payload = {
-            "user_data": {
-                **user_input,
-                **conversation_details,
-            },
-            "documents": documents_summary,
-        }
-        result_raw = self.kyc_agent.run(payload)
-        result = self._ensure_dict(result_raw)
-        self._session_state["kyc_result"] = result
-        self._record_audit_event("KycAgent", payload, result)
-        self._record_performance("KycAgent", time.time() - start_time)
-        return json.dumps(result)
-
-    def _run_advisor_step(self, _: Any = None) -> str:
-        start_time = time.time()
-        user_input = self._session_state.get("user_input", {}) or {}
-        if not isinstance(user_input, dict):
-            user_input = {}
-        yearly_income = (
-            user_input.get("yearly_income")
-            if user_input.get("yearly_income") is not None
-            else user_input.get("income")
-        )
-        if yearly_income is None:
-            yearly_income = 0
-        try:
-            yearly_income_value = float(yearly_income)
-        except (TypeError, ValueError):
-            yearly_income_value = 0.0
-        questions = user_input.get("questions", {})
-        if not isinstance(questions, dict):
-            questions = {}
-        conversation_details = self._ensure_dict(self._session_state.get("conversation_result"))
-        if not isinstance(conversation_details, dict):
-            conversation_details = {}
-        kyc_result = self._ensure_dict(self._session_state.get("kyc_result"))
-        if not isinstance(kyc_result, dict):
-            kyc_result = {}
-        payload = {
-            "case_id": self._session_state.get("session_id"),
-            "address": user_input.get("address"),
-            "yearly_income": yearly_income_value,
-            "questions": questions,
-            "user_profile": conversation_details,
-            "kyc_result": kyc_result,
-        }
-        result_raw = self.advisor_agent.run(payload)
-        result = self._ensure_dict(result_raw)
-        self._session_state["advisor_result"] = result
-        self._record_audit_event("AdvisorAgent", payload, result)
-        self._record_performance("AdvisorAgent", time.time() - start_time)
-        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # Public orchestration API
@@ -267,6 +50,7 @@ class BankBotOrchestrator:
         conversation_context: Dict[str, Any],
         documents: Optional[Any] = None,
         session_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Kick off the CrewAI workflow and return aggregated results."""
         resolved_session_id = session_id or str(uuid.uuid4())
@@ -290,33 +74,10 @@ class BankBotOrchestrator:
             "performance": {},
         }
         # The orchestrator always flows data sequentially: Conversation -> KYC -> Advisor -> Audit.
-        # Each stage stores its structured output back into _session_state so downstream agents
-        # receive a consistent dictionary when they execute.
-
-        if not self._use_llm or not self.crew:
-            LOGGER.info("Executing fallback workflow for session %s (LLM disabled or unavailable).", resolved_session_id)
-            # When Ollama is offline we short-circuit the CrewAI stack and execute agents sequentially.
-            results = self._run_fallback_workflow()
-            return results
-
-        inputs = {
-            "session_id": resolved_session_id,
-            "conversation_context": json.dumps(sanitized_context, default=str),
-        }
-        LOGGER.info("Launching workflow for session %s", resolved_session_id)
-        try:
-            self.crew.kickoff(inputs=inputs)
-        except Exception as exc:
-            LOGGER.exception("Crew execution failed for session %s; falling back to sequential run: %s", resolved_session_id, exc)
-            return self._run_fallback_workflow()
-
-        # Record a final audit snapshot combining all outcomes.
-        self._record_audit_event(
-            "AuditAgent",
-            {"conversation": self._session_state["conversation_result"], "kyc": self._session_state["kyc_result"]},
-            self._session_state.get("advisor_result"),
-        )
-        return self.aggregate_results()
+        # Each stage stores its structured output back into _session_state so downstream agents receive
+        # a consistent dictionary when they execute.
+        LOGGER.info("Executing sequential workflow for session %s", resolved_session_id)
+        return self._run_sequential_workflow(progress_callback=progress_callback)
 
     def aggregate_results(self) -> Dict[str, Any]:
         """Prepare structured output for the Streamlit frontend."""
@@ -362,8 +123,11 @@ class BankBotOrchestrator:
         LOGGER.info("Aggregated workflow results for session %s", session_id)
         return final_payload
 
-    def _run_fallback_workflow(self) -> Dict[str, Any]:
-        """Run a lightweight placeholder workflow when LLMs are disabled."""
+    def _run_sequential_workflow(
+        self,
+        progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Run the deterministic multi-agent pipeline sequentially."""
         context = self._ensure_dict(self._session_state.get("conversation_context", {}))
         start_time = time.time()
         conversation_result = self._ensure_dict(self.conversation_agent.run(context))
@@ -375,6 +139,7 @@ class BankBotOrchestrator:
         self._session_state["conversation_summary"] = self._derive_conversation_summary(conversation_result)
         self._record_audit_event("ConversationAgent", context, conversation_result)
         self._record_performance("ConversationAgent", time.time() - start_time)
+        self._notify_progress("ConversationAgent", conversation_result, progress_callback)
 
         kyc_payload = {
             "user_data": {
@@ -388,6 +153,7 @@ class BankBotOrchestrator:
         self._session_state["kyc_result"] = kyc_result
         self._record_audit_event("KycAgent", kyc_payload, kyc_result)
         self._record_performance("KycAgent", time.time() - start_time)
+        self._notify_progress("KycAgent", kyc_result, progress_callback)
 
         user_input = self._session_state.get("user_input", {}) or {}
         yearly_income = (
@@ -408,11 +174,17 @@ class BankBotOrchestrator:
         self._session_state["advisor_result"] = advisor_result
         self._record_audit_event("AdvisorAgent", advisor_payload, advisor_result)
         self._record_performance("AdvisorAgent", time.time() - start_time)
+        self._notify_progress("AdvisorAgent", advisor_result, progress_callback)
 
         self._record_audit_event(
             "AuditAgent",
             {"conversation": conversation_result, "kyc": kyc_result},
             advisor_result,
+        )
+        self._notify_progress(
+            "AuditAgent",
+            {"conversation": conversation_result, "kyc": kyc_result, "advisor": advisor_result},
+            progress_callback,
         )
         return self.aggregate_results()
 
@@ -472,6 +244,7 @@ class BankBotOrchestrator:
         if not cleaned:
             return context if isinstance(context, dict) else {}
         return cleaned
+
     @staticmethod
     def _ensure_dict(payload: Any) -> Dict[str, Any]:
         if isinstance(payload, dict):
@@ -483,28 +256,18 @@ class BankBotOrchestrator:
                 return {"raw_output": payload}
         return json.loads(json.dumps(payload, default=str))
 
-
-class _FallbackPlannerLLM(LLM):
-    """Minimal LLM stub so CrewAI can continue while Ollama is unavailable."""
-
-    def _call(
+    def _notify_progress(
         self,
-        prompt: str,
-        stop: Optional[list[str]] = None,
-        run_manager: Optional[Any] = None,
-        **kwargs: Any,
-    ) -> str:
-        return (
-            "Crew coordination fallback response. Continue using existing task outputs without additional planning."
-        )
-
-    @property
-    def _identifying_params(self) -> Dict[str, Any]:
-        return {"name": "FallbackPlannerLLM"}
-
-    @property
-    def _llm_type(self) -> str:
-        return "fallback"
+        stage: str,
+        payload: Dict[str, Any],
+        callback: Optional[Callable[[str, Dict[str, Any]], None]],
+    ) -> None:
+        if not callback:
+            return
+        try:
+            callback(stage, payload)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.warning("Progress callback for stage %s failed: %s", stage, exc)
 
 
 def _is_ollama_available(base_url: str) -> bool:
