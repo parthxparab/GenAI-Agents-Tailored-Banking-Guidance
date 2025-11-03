@@ -1,4 +1,5 @@
 // Optional SPOT node group for bursty workloads while keeping idle cost at zero.
+// Nodes sit in public subnets so they receive public IPs and can reach the EKS API without a NAT gateway.
 locals {
   kube_version_parts   = split(".", var.kubernetes_version)
   kube_major           = length(local.kube_version_parts) > 0 ? tonumber(local.kube_version_parts[0]) : 1
@@ -20,7 +21,7 @@ resource "aws_eks_node_group" "spot" {
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "${var.cluster_name}-spot"
   node_role_arn   = aws_iam_role.node_group[0].arn
-  subnet_ids      = local.selected_private_subnet_ids
+  subnet_ids      = local.selected_public_subnet_ids
 
   scaling_config {
     desired_size = var.node_desired_size

@@ -72,6 +72,7 @@ node_architecture      = "arm64" # switch to x86 if necessary
 - Module defaults keep `desired_size`, `min_size`, and `max_size` at 0/0/1, but the provided `terraform.tfvars` pins them to 1/1/1 to maintain a ready node.
 - Instance types in `spot_instance_types` are automatically filtered to match the selected `node_architecture`. If the filtered list is empty, Terraform falls back to `t4g.small` for arm64 or `t3.small` for x86.
 - AMI type switches to Amazon Linux 2023 images when `kubernetes_version` is 1.30 or newer (covering upcoming 1.34), and stays on Amazon Linux 2 for older clusters.
+- Node groups attach to the public subnets so instances obtain public IPs and can reach the EKS API/SSM endpoints without a NAT Gateway. If you require private-only nodes, add either a NAT Gateway or the necessary VPC interface endpoints before switching the subnet list.
 - Ensure your container images support arm64. Verify quickly with:
 
 ```bash
