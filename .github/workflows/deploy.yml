@@ -1,0 +1,67 @@
+name: Deploy to EKS
+
+on:
+  workflow_dispatch:  # Manual trigger
+    branches: [ main ]  # Restrict to main branch
+
+env:
+  AWS_REGION: us-east-1
+  HELM_CHART_BUCKET: s3://helm-chart-e107d0a4
+
+permissions:
+  id-token: write # Needed for AWS authentication
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Install required tools
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.2'  # Specify a version for reproducibility
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.3'  # Match your EKS cluster version
+
+      # Configure kubectl for EKS
+      - name: Update kube config
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${AWS_REGION}
+
+      # Download latest chart from S3
+      - name: Download Helm chart
+        run: |
+          # Get the latest chart version from S3
+          latest_chart=$(aws s3 ls ${HELM_CHART_BUCKET}/ | sort | tail -n 1 | awk '{print $4}')
+          aws s3 cp "${HELM_CHART_BUCKET}/${latest_chart}" .
+          echo "Downloaded chart: ${latest_chart}"
+
+      # Deploy using Helm
+      - name: Deploy to EKS
+        run: |
+          # Deploy/upgrade the release
+          helm upgrade --install genai ./*.tgz \
+            --namespace genai \
+            --create-namespace \
+            --atomic \
+            --timeout 5m
+
+      # Print deployment status
+      - name: Print deployment status
+        run: |
+          echo "Deployment Status:"
+          helm status genai -n genai
+          
+          echo "\nPod Status:"
+          kubectl get pods -n genai
