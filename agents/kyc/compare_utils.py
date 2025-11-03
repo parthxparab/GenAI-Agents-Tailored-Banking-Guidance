@@ -39,7 +39,7 @@ def _score_dates(ocr_value: str, expected: str) -> float:
 
 
 def evaluate_user_data(
-    ocr_lines: Iterable[str], expected_full_name: str | None, expected_dob: str | None
+    ocr_lines: Iterable[str], expected_full_name: Optional[str], expected_dob: Optional[str]
 ) -> ComparisonResult:
     lines = [line for line in ocr_lines if line]
     normalised_name = _normalise(expected_full_name) if expected_full_name else ""

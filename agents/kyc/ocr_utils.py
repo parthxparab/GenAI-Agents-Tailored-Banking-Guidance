@@ -1,6 +1,6 @@
 import os
 from functools import lru_cache
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 import easyocr
 
@@ -13,7 +13,7 @@ def _get_reader(languages: Sequence[str]) -> easyocr.Reader:
     return easyocr.Reader(list(languages), gpu=False)
 
 
-def extract_text(file_path: str, languages: Sequence[str] | None = None) -> Dict[str, List[str] | str]:
+def extract_text(file_path: str, languages: Optional[Sequence[str]] = None) -> Dict[str, Union[List[str], str]]:
     """
     Run OCR on the provided image file and return recognised lines.
 
