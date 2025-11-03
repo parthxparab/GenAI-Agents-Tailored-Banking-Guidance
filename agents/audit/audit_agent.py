@@ -1,214 +1,158 @@
+"""Audit agent scaffold that logs activity while using LangChain with Ollama."""
+
 from __future__ import annotations
 
 import json
 import logging
 import os
-import signal
-import sys
-import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-import redis
+import requests
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_community.llms import Ollama
 
-from genai_client import run_llm
-
-LOG_FORMAT = "[%(asctime)s] [AUDIT_AGENT] %(levelname)s: %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("audit_agent")
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-AUDIT_CHANNEL = os.getenv("AUDIT_CHANNEL", "audit")
-ORCHESTRATOR_CHANNEL = os.getenv("ORCHESTRATOR_CHANNEL", "orchestrator")
-AUDIT_DIR = Path(os.getenv("AUDIT_LOG_DIR", "/data/audit_logs"))
-AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Summary: Compile downstream agent outputs, rely on Ollama for the final verdict, persist an audit
-# record to disk, and notify the orchestrator that onboarding has finished.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [AuditAgent] %(message)s")
+LOGGER = logging.getLogger("audit_agent")
 
 
-def connect_redis() -> redis.Redis:
-    logger.info("Connecting to Redis at %s", REDIS_URL)
-    return redis.from_url(REDIS_URL)
+class AuditAgent:
+    """Placeholder audit agent that captures an audit trail and summary response."""
 
+    def __init__(self, model_name: str = None, log_dir: str | None = None) -> None:
+        self.model_name = model_name or os.getenv("AUDIT_AGENT_MODEL", "llama3")
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        self.enable_llm = os.getenv("ENABLE_OLLAMA", "false").lower() in {"1", "true", "yes"}
+        configured_dir = log_dir or os.getenv("AUDIT_LOG_DIR")
+        default_dir = Path(__file__).resolve().parents[2] / "audit_logs"
+        self.log_dir = Path(configured_dir) if configured_dir else default_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.llm = Ollama(model=self.model_name, base_url=self.base_url) if self.enable_llm else None
+        self.prompt = PromptTemplate(
+            input_variables=["session_data"],
+            template=(
+                "You are the audit agent for the BankBot Crew workflow.\n"
+                "Review the JSON session data and craft a brief summary.\n"
+                "Respond ONLY with JSON containing: summary, verdict, next_steps.\n"
+                "Session Data: {session_data}"
+            ),
+        )
+        self.chain = LLMChain(llm=self.llm, prompt=self.prompt, verbose=False) if self.enable_llm and self.llm else None
 
-def build_prompt(payload: Dict[str, Any]) -> str:
-    prompt = f"""
-You are an audit assistant for a bank's onboarding AI workflow.
-Use the following agent outputs to prepare the final audit summary.
+    def run(self, input_data: Dict[str, Any]) -> str:
+        """Create a placeholder audit summary and append an audit log entry."""
+        session_id = str(
+            input_data.get("session_id")
+            or input_data.get("task_id")
+            or f"session_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        )
+        LOGGER.info("Running audit for session_id=%s", session_id)
+        serialized_data = json.dumps(input_data, default=str)
 
-Conversation Agent Result:
-{json.dumps(payload.get("conversation_result", {}), indent=2)}
+        status = "success"
+        output = ""
+        error_message = None
 
-KYC Agent Result:
-{json.dumps(payload.get("kyc_result", {}), indent=2)}
-
-Product Advisor Agent Result:
-{json.dumps(payload.get("advisor_result", {}), indent=2)}
-
-Write a concise audit summary (3-4 sentences) describing key outcomes, risks, and recommendations.
-Classify the final verdict as one of: "approved", "manual_review", "rejected".
-Return ONLY JSON in this exact format:
-{{
-  "summary": "<summary text>",
-  "verdict": "<approved|manual_review|rejected>"
-}}
-""".strip()
-    return prompt
-
-
-def fallback_result() -> Dict[str, str]:
-    return {
-        "summary": "Onboarding completed. Awaiting final review; no critical blockers detected.",
-        "verdict": "approved",
-    }
-
-
-def validate_response(response: Dict[str, Any]) -> Dict[str, str]:
-    summary = str(response.get("summary", "")).strip()
-    verdict = str(response.get("verdict", "")).strip().lower()
-    valid_verdicts = {"approved", "manual_review", "rejected"}
-    if not summary or verdict not in valid_verdicts:
-        raise ValueError("Invalid audit response.")
-    return {"summary": summary, "verdict": verdict}
-
-
-def summarize_audit(payload: Dict[str, Any]) -> Dict[str, str]:
-    prompt = build_prompt(payload)
-    logger.info("Prompting LLM for audit summary.")
-    response = run_llm(prompt)
-
-    if isinstance(response, dict) and "error" in response:
-        logger.error("LLM error: %s", response)
-        return fallback_result()
-
-    try:
-        validated = validate_response(response)
-        logger.info("LLM summary validated.")
-        return validated
-    except Exception as exc:
-        logger.error("Failed to validate LLM output: %s", exc)
-        return fallback_result()
-
-
-def save_audit_log(task_id: str, record: Dict[str, Any]) -> Path:
-    timestamp = datetime.utcnow().isoformat()
-    record_with_meta = {
-        **record,
-        "task_id": task_id,
-        "timestamp": timestamp,
-    }
-    path = AUDIT_DIR / f"{task_id}.json"
-    path.write_text(json.dumps(record_with_meta, indent=2))
-    logger.info("Saved audit log to %s", path)
-    return path
-
-
-def publish_result(redis_client: redis.Redis, message: Dict[str, Any]) -> None:
-    payload = json.dumps(message, default=str)
-    redis_client.publish(ORCHESTRATOR_CHANNEL, payload)
-    logger.info("Published audit result for task_id=%s", message.get("task_id"))
-
-
-def handle_message(redis_client: redis.Redis, payload: Dict[str, Any]) -> None:
-    task_id = payload.get("task_id")
-    user_id = payload.get("user_id")
-    step = payload.get("step")
-
-    if step != "audit_start":
-        logger.debug("Ignoring message step=%s", step)
-        return
-
-    if not task_id or not user_id:
-        logger.error("Invalid payload received: %s", payload)
-        return
-
-    logger.info("Processing audit_start for task_id=%s user_id=%s", task_id, user_id)
-    summary = summarize_audit(payload)
-
-    full_record = {
-        "user_id": user_id,
-        "conversation_result": payload.get("conversation_result"),
-        "kyc_result": payload.get("kyc_result"),
-        "advisor_result": payload.get("advisor_result"),
-        "audit_summary": summary,
-    }
-    save_audit_log(task_id, full_record)
-
-    outgoing = {
-        "task_id": task_id,
-        "user_id": user_id,
-        "step": "audit_done",
-        "result": summary,
-    }
-    publish_result(redis_client, outgoing)
-
-
-def listen_for_messages() -> None:
-    redis_client = connect_redis()
-    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe(AUDIT_CHANNEL)
-    logger.info("Subscribed to Redis channel '%s'", AUDIT_CHANNEL)
-
-    stop_event = threading.Event()
-
-    def handle_shutdown(signum: int, frame: Any) -> None:
-        logger.info("Received signal %s; shutting down audit agent.", signum)
-        stop_event.set()
-        pubsub.close()
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    while not stop_event.is_set():
-        try:
-            message = pubsub.get_message(timeout=1.0)
-            if not message:
-                continue
-            data = message.get("data")
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-            if not data:
-                continue
-            logger.info("Received message on audit channel: %s", data)
+        if not self.enable_llm:
+            LOGGER.info("LLM disabled for AuditAgent; returning scripted summary.")
+            status = "degraded"
+            output = json.dumps(
+                {
+                    "summary": "Audit service configured for placeholder mode.",
+                    "verdict": "pending_review",
+                    "next_steps": ["Enable ENABLE_OLLAMA=true to activate AI summaries."],
+                }
+            )
+        elif not _is_ollama_available(self.base_url):
+            LOGGER.warning("Ollama not reachable; returning fallback audit summary.")
+            status = "degraded"
+            output = json.dumps(
+                {
+                    "summary": "Audit service warming up — using placeholder log summary.",
+                    "verdict": "pending_review",
+                    "next_steps": ["Re-run audit once AI services are reachable."],
+                }
+            )
+        else:
             try:
-                payload = json.loads(data)
+                if not self.chain:
+                    raise RuntimeError("Audit chain is not initialised.")
+                response = self.chain.invoke({"session_data": serialized_data})
+                output = response.strip() if isinstance(response, str) else str(response)
+                if not output:
+                    raise ValueError("Audit agent returned an empty response.")
+                LOGGER.debug("Audit agent raw response: %s", output)
+            except Exception as exc:  # pragma: no cover - defensive safety net
+                status = "error"
+                error_message = str(exc)
+                LOGGER.exception("Audit agent failed: %s", exc)
+                fallback = {
+                    "summary": "Placeholder audit summary awaiting finalized implementation.",
+                    "verdict": "pending_review",
+                    "next_steps": ["Escalate to human reviewer once full logic is in place."],
+                }
+                output = json.dumps(fallback)
+
+        event = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "agent_name": "AuditAgent",
+            "action": "run",
+            "status": status,
+            "data_summary": self._summarize_for_log(input_data),
+            "result_preview": self._truncate(output),
+        }
+        if error_message:
+            event["error"] = error_message
+        self._append_audit_event(session_id, event)
+
+        return output
+
+    def _append_audit_event(self, session_id: str, event: Dict[str, Any]) -> None:
+        log_path = self.log_dir / f"{session_id}.json"
+        history: List[Any]
+        if log_path.exists():
+            try:
+                history = json.loads(log_path.read_text())
+                if not isinstance(history, list):
+                    history = [history]
             except json.JSONDecodeError:
-                logger.error("Failed to decode audit message: %s", data)
-                continue
-            handle_message(redis_client, payload)
-        except redis.ConnectionError as exc:
-            logger.error("Redis connection error: %s. Reconnecting shortly.", exc)
-            redis_client = connect_redis()
-            pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
-            pubsub.subscribe(AUDIT_CHANNEL)
-        except Exception as exc:  # pragma: no cover
-            logger.exception("Unexpected error in audit loop: %s", exc)
+                LOGGER.warning("Existing audit log for %s is not valid JSON; starting fresh.", session_id)
+                history = []
+        else:
+            history = []
 
-    logger.info("Audit agent stopped.")
+        history.append(event)
+        log_path.write_text(json.dumps(history, indent=2))
+        LOGGER.info("Appended audit event to %s", log_path)
 
+    @staticmethod
+    def _summarize_for_log(data: Dict[str, Any]) -> Dict[str, Any]:
+        keys = sorted(data.keys())
+        summary = {key: data[key] for key in keys if key != "raw_messages"}
+        return json.loads(json.dumps(summary, default=str))
 
-def simulate_mode() -> None:
-    logger.info("Simulation mode activated.")
-    sample_payload = {
-        "task_id": "simulated-task",
-        "user_id": "simulated-user",
-        "step": "audit_start",
-        "conversation_result": {"intent": "credit_card", "collected_data": {"full_name": "Sim User"}},
-        "kyc_result": {"status": "verified"},
-        "advisor_result": {"recommendations": [{"card_name": "SmartSaver Visa Platinum"}]},
-    }
-    summary = summarize_audit(sample_payload)
-    logger.info("Simulation summary: %s", json.dumps(summary, indent=2))
-
-
-def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "simulate":
-        simulate_mode()
-        return
-    listen_for_messages()
+    @staticmethod
+    def _truncate(text: str, limit: int = 256) -> str:
+        return text if len(text) <= limit else f"{text[:limit]}..."
 
 
 if __name__ == "__main__":
-    main()
+    sample_session = {
+        "session_id": "demo-session",
+        "conversation_result": {"greeting": "Hi", "requested_information": ["address"]},
+        "kyc_result": {"status": "manual_review"},
+        "advisor_result": {"recommendations": ["Placeholder"]},
+    }
+    agent = AuditAgent()
+    print(agent.run(sample_session))
+
+
+def _is_ollama_available(base_url: str) -> bool:
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=0.5)
+        return response.ok
+    except requests.RequestException:
+        return False

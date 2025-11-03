@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   ollama:
     image: ollama/ollama:latest
@@ -9,89 +7,33 @@ services:
       - ollama:/root/.ollama
     restart: unless-stopped
 
-  redis:
-    image: redis:7
-    ports:
-      - "6379:6379"
-
-  rq-dashboard:
-    image: eoranged/rq-dashboard
-    ports:
-      - "9181:9181"
-    environment:
-      - RQ_DASHBOARD_REDIS_URL=redis://redis:6379/0
-    depends_on:
-      - redis
-
-  gateway_worker:
-    build: ./gateway
-    command: ["python", "worker.py"]
-    depends_on:
-      - redis
-      
   gateway:
-    build: ./gateway
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     ports:
       - "8000:8000"
-    depends_on:
-      - redis
-    # Share uploaded documents with downstream verifiers.
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - LOG_LEVEL=INFO
     volumes:
-      - uploads:/data/uploads
-
-  orchestrator:
-    build: ./orchestrator
-    depends_on:
-      - redis
-    deploy:
-      replicas: 1
-
-  conversation:
-    build: ./agents/conversation
+      - audit_logs:/app/audit_logs
     depends_on:
       - ollama
-      - redis
-    deploy:
-      replicas: 2
-    environment:
-      - OLLAMA_URL=http://ollama:11434
+    restart: unless-stopped
 
-  kyc:
-    build: ./agents/kyc
-    depends_on:
-      - ollama
-      - redis
-    deploy:
-      replicas: 2
-    volumes:
-      - uploads:/data/uploads
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "8501:8501"
     environment:
-      - OLLAMA_URL=http://ollama:11434
-
-  advisor:
-    build: ./agents/advisor
+      - GATEWAY_URL=http://gateway:8000
     depends_on:
-      - ollama
-      - redis
-    deploy:
-      replicas: 2
-    environment:
-      - OLLAMA_URL=http://ollama:11434
-
-  audit:
-    build: ./agents/audit
-    depends_on:
-      - ollama
-      - redis
-    deploy:
-      replicas: 1
-    # Persist audit logs for review and demos.
-    volumes:
-      - audit_logs:/data/audit_logs
-    environment:
-      - OLLAMA_URL=http://ollama:11434
+      - gateway
+    restart: unless-stopped
 
 volumes:
   ollama:
-  uploads:
   audit_logs:

@@ -1,215 +1,93 @@
+"""Conversation agent scaffold using a LangChain ConversationChain with Ollama."""
+
 from __future__ import annotations
 
 import json
 import logging
 import os
-import signal
-import sys
-import threading
-import time
 from typing import Any, Dict
 
-import redis
+import requests
+from langchain.chains import ConversationChain
+from langchain.memory import ConversationBufferMemory
+from langchain_community.llms import Ollama
 
-from genai_client import run_llm
-
-LOG_FORMAT = "[%(asctime)s] [CONVERSATION_AGENT] %(levelname)s: %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("conversation_agent")
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-CONVERSATION_CHANNEL = os.getenv("CONVERSATION_CHANNEL", "conversation")
-ORCHESTRATOR_CHANNEL = os.getenv("ORCHESTRATOR_CHANNEL", "orchestrator")
-LLM_MODEL = os.getenv("CONVERSATION_LLM_MODEL", "llama3")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [ConversationAgent] %(message)s")
+LOGGER = logging.getLogger("conversation_agent")
 
 
-def connect_redis() -> redis.Redis:
-    logger.info("Connecting to Redis at %s", REDIS_URL)
-    return redis.from_url(REDIS_URL)
+class ConversationAgent:
+    """Placeholder conversation agent to gather onboarding details."""
 
+    def __init__(self, model_name: str = None) -> None:
+        self.model_name = model_name or os.getenv("CONVERSATION_AGENT_MODEL", "llama3")
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        self.enable_llm = os.getenv("ENABLE_OLLAMA", "false").lower() in {"1", "true", "yes"}
+        self.llm = Ollama(model=self.model_name, base_url=self.base_url) if self.enable_llm else None
+        self.memory = ConversationBufferMemory(return_messages=True) if self.enable_llm else None
+        self.chain = (
+            ConversationChain(llm=self.llm, memory=self.memory, verbose=False) if self.enable_llm and self.llm else None
+        )
 
-def extract_structured_data(llm_output: Dict[str, Any]) -> Dict[str, Any]:
-    intent = llm_output.get("intent")
-    full_name = llm_output.get("full_name")
-    dob = llm_output.get("dob")
-    country = llm_output.get("country")
+    def run(self, input_data: Dict[str, Any]) -> str:
+        """Engage with the user context and return JSON placeholder output."""
+        if self.enable_llm and self.memory:
+            self.memory.clear()
+        LOGGER.info("Starting conversation agent run with context keys: %s", list(input_data.keys()))
+        serialized_context = json.dumps(input_data, default=str)
+        prompt = (
+            "You are the conversation agent for the BankBot Crew onboarding workflow.\n"
+            "Given the prior context, craft a short greeting and list the next information you intend to collect.\n"
+            "Respond ONLY with JSON using keys: greeting, requested_information, notes.\n"
+            f"Context: {serialized_context}"
+        )
 
-    missing_fields = [field for field, value in [("intent", intent), ("full_name", full_name), ("dob", dob), ("country", country)] if not value]
-    if missing_fields:
-        logger.warning("LLM output missing fields %s; falling back to manual review", missing_fields)
-        return {
-            "intent": "manual_review",
-            "collected_data": {
-                "full_name": full_name or "",
-                "dob": dob or "",
-                "country": country or "",
-                "notes": llm_output.get("raw_output") or llm_output,
-            },
-        }
+        if not self.enable_llm:
+            LOGGER.info("LLM disabled for ConversationAgent; returning scripted response.")
+            return json.dumps(self._fallback_response())
 
-    collected = {
-        "full_name": str(full_name),
-        "dob": str(dob),
-        "country": str(country),
-    }
-    return {"intent": str(intent), "collected_data": collected}
+        if not _is_ollama_available(self.base_url):
+            LOGGER.warning("Ollama not reachable; returning fallback conversation response.")
+            return json.dumps(self._fallback_response())
 
-
-def run_conversation(task_id: str, user_id: str) -> Dict[str, Any]:
-    prompt = f"""
-You are a friendly onboarding assistant for a bank.
-The user has just started onboarding (task_id: {task_id}, user_id: {user_id}).
-Please have a short conversation to gather their full name, date of birth (YYYY-MM-DD), and country of residence.
-Understand what banking product they are interested in (e.g., open account, savings, credit card).
-Respond ONLY with JSON in the following format once you have the information:
-{{
-  "intent": "<detected_intent>",
-  "full_name": "<full name>",
-  "dob": "<YYYY-MM-DD>",
-  "country": "<country>"
-}}
-Do not include any additional text outside the JSON payload.
-"""
-
-    logger.info("Prompting LLM model %s for task_id=%s user_id=%s", LLM_MODEL, task_id, user_id)
-    llm_response = run_llm(prompt.strip(), model=LLM_MODEL)
-    logger.info("Raw LLM response: %s", llm_response)
-
-    if llm_response is None:
-        logger.error("LLM returned no response; marking for manual review")
-        return {
-            "intent": "manual_review",
-            "collected_data": {
-                "full_name": "",
-                "dob": "",
-                "country": "",
-                "notes": "LLM returned no response.",
-            },
-        }
-
-    if isinstance(llm_response, dict) and "error" in llm_response:
-        logger.error("LLM invocation failed: %s", llm_response)
-        return {
-            "intent": "manual_review",
-            "collected_data": {
-                "full_name": "",
-                "dob": "",
-                "country": "",
-                "notes": llm_response,
-            },
-        }
-
-    if not isinstance(llm_response, dict):
-        logger.warning("Unexpected LLM response type: %s", type(llm_response))
-        return {
-            "intent": "manual_review",
-            "collected_data": {
-                "full_name": "",
-                "dob": "",
-                "country": "",
-                "notes": llm_response,
-            },
-        }
-
-    return extract_structured_data(llm_response)
-
-
-def publish_result(redis_client: redis.Redis, message: Dict[str, Any]) -> None:
-    payload = json.dumps(message, default=str)
-    redis_client.publish(ORCHESTRATOR_CHANNEL, payload)
-    logger.info("Published result to orchestrator: %s", payload)
-
-
-def handle_message(redis_client: redis.Redis, data: Dict[str, Any]) -> None:
-    task_id = data.get("task_id")
-    user_id = data.get("user_id")
-    step = data.get("step")
-
-    if step != "conversation_start":
-        logger.debug("Ignoring message for step=%s task_id=%s", step, task_id)
-        return
-
-    if not task_id or not user_id:
-        logger.error("Invalid conversation message payload: %s", data)
-        return
-
-    logger.info("Processing conversation_start for task_id=%s user_id=%s", task_id, user_id)
-    structured_result = run_conversation(task_id, user_id)
-
-    outgoing_message = {
-        "task_id": task_id,
-        "user_id": user_id,
-        "step": "conversation_done",
-        "result": structured_result,
-    }
-    publish_result(redis_client, outgoing_message)
-
-
-def listen_for_messages() -> None:
-    redis_client = connect_redis()
-    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe(CONVERSATION_CHANNEL)
-    logger.info("Subscribed to Redis channel '%s'", CONVERSATION_CHANNEL)
-
-    stop_event = threading.Event()
-
-    def handle_shutdown(signum: int, frame: Any) -> None:
-        logger.info("Received signal %s, shutting down conversation agent.", signum)
-        stop_event.set()
-        pubsub.close()
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    while not stop_event.is_set():
         try:
-            message = pubsub.get_message(timeout=1.0)
-            if not message:
-                continue
-            data = message.get("data")
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-            if not data:
-                continue
-            logger.info("Received message from conversation channel: %s", data)
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
-                logger.error("Failed to decode message: %s", data)
-                continue
-            handle_message(redis_client, payload)
-        except redis.ConnectionError as exc:
-            logger.error("Redis connection error: %s. Retrying in 5 seconds.", exc)
-            time.sleep(5)
-            redis_client = connect_redis()
-            pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
-            pubsub.subscribe(CONVERSATION_CHANNEL)
-        except Exception as exc:  # pragma: no cover - safety net
-            logger.exception("Unexpected error while processing messages: %s", exc)
+            if not self.chain:
+                raise RuntimeError("Conversation chain is not initialised.")
+            response = self.chain.predict(input=prompt)
+            output = response.strip() if isinstance(response, str) else str(response)
+            if not output:
+                raise ValueError("Conversation agent returned an empty string.")
+            LOGGER.debug("Conversation agent raw response: %s", output)
+            return output
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            LOGGER.exception("Conversation agent failed: %s", exc)
+            return json.dumps(self._fallback_response())
 
-    logger.info("Conversation agent stopped.")
-
-
-def simulate_mode() -> None:
-    logger.info("Simulation mode activated; no Redis interactions will occur.")
-    sample_message = {"task_id": "simulated-task", "user_id": "simulated-user", "step": "conversation_start"}
-    structured_result = run_conversation(sample_message["task_id"], sample_message["user_id"])
-    simulated_payload = {
-        "task_id": sample_message["task_id"],
-        "user_id": sample_message["user_id"],
-        "step": "conversation_done",
-        "result": structured_result,
-    }
-    logger.info("Simulation result: %s", json.dumps(simulated_payload, indent=2))
-
-
-def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "simulate":
-        simulate_mode()
-        return
-
-    listen_for_messages()
+    @staticmethod
+    def _fallback_response() -> Dict[str, Any]:
+        return {
+            "greeting": "Hello! I'm here to help with your onboarding.",
+            "requested_information": ["full_name", "date_of_birth", "country"],
+            "notes": "Placeholder conversation response while the AI service initializes.",
+        }
 
 
 if __name__ == "__main__":
-    main()
+    sample_context = {
+        "session_id": "demo-session",
+        "recent_messages": [
+            {"sender": "user", "content": "Hi, I'm interested in opening an account."},
+        ],
+    }
+    agent = ConversationAgent()
+    print(agent.run(sample_context))
+
+
+def _is_ollama_available(base_url: str) -> bool:
+    """Quick health probe for Ollama to avoid blocking when the model is unavailable."""
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=0.5)
+        return response.ok
+    except requests.RequestException:
+        return False

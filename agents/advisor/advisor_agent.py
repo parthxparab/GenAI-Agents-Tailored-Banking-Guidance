@@ -1,16 +1,16 @@
+"""Advisor agent scaffold providing placeholder recommendations via LangChain."""
+
 from __future__ import annotations
 
 import json
 import logging
 import os
-import random
-import signal
-import sys
-import threading
-import time
 from typing import Any, Dict, List
 
-import redis
+import requests
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_community.llms import Ollama
 
 from credit_cards import CREDIT_CARDS
 from langchain_client import get_credit_card_recommendations
@@ -272,16 +272,13 @@ def simulate_mode() -> None:
             "q5_simple_card": "yes",
         },
     }
-    recommendations = recommend_credit_cards(sample_profile)
-    logger.info("Simulation recommendations: %s", json.dumps(recommendations, indent=2))
+    agent = AdvisorAgent()
+    print(agent.run({"user_profile": sample_profile}))
 
 
-def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "simulate":
-        simulate_mode()
-        return
-    listen_for_messages()
-
-
-if __name__ == "__main__":
-    main()
+def _is_ollama_available(base_url: str) -> bool:
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=0.5)
+        return response.ok
+    except requests.RequestException:
+        return False

@@ -1,0 +1,70 @@
+{{- range $name, $component := .Values.components }}
+{{- if $component.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "genai-stack.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "genai-stack.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $component.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "genai-stack.component.selectorLabels" (dict "componentName" $name "Chart" $.Chart "Release" $.Release "Values" $.Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "genai-stack.component.selectorLabels" (dict "componentName" $name "Chart" $.Chart "Release" $.Release "Values" $.Values) | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ $name }}
+          image: {{ $component.image.repository }}:{{ $component.image.tag | default $.Values.imageDefaults.tag }}
+          imagePullPolicy: {{ $component.image.pullPolicy | default $.Values.imageDefaults.pullPolicy }}
+          {{- if $component.containerPort }}
+          ports:
+            - containerPort: {{ $component.containerPort }}
+          {{- end }}
+          {{- if $component.env }}
+          env:
+            {{- toYaml $component.env | nindent 12 }}
+          {{- end }}
+          {{- if $component.resources }}
+          resources:
+            {{- toYaml $component.resources | nindent 12 }}
+          {{- end }}
+{{- if or $.Values.nodeSelector $.Values.affinity $.Values.tolerations }}
+      {{- if $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml $.Values.nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- if $.Values.affinity }}
+      affinity:
+        {{- toYaml $.Values.affinity | nindent 8 }}
+      {{- end }}
+      {{- if $.Values.tolerations }}
+      tolerations:
+        {{- toYaml $.Values.tolerations | nindent 8 }}
+      {{- end }}
+{{- end }}
+---
+{{- if $component.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "genai-stack.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "genai-stack.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  type: {{ $component.service.type | default "ClusterIP" }}
+  ports:
+    - name: http
+      port: {{ $component.service.port | default 80 }}
+      targetPort: {{ $component.service.targetPort | default ($component.containerPort | default 80) }}
+  selector:
+    {{- include "genai-stack.component.selectorLabels" (dict "componentName" $name "Chart" $.Chart "Release" $.Release "Values" $.Values) | nindent 4 }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

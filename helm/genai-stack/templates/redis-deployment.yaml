@@ -1,0 +1,46 @@
+{{- if .Values.redis }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "genai-stack.fullname" . }}-redis
+  labels:
+    {{- include "genai-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "genai-stack.component.selectorLabels" (dict "componentName" "redis" "Chart" .Chart "Release" .Release "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "genai-stack.component.selectorLabels" (dict "componentName" "redis" "Chart" .Chart "Release" .Release "Values" .Values) | nindent 8 }}
+    spec:
+      containers:
+        - name: redis
+          image: {{ printf "%s:%s" .Values.redis.image.repository .Values.redis.image.tag }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.redis.service.port }}
+          args: ["--save", "", "--appendonly", "no"]
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+{{- end }}
+---
+{{- if .Values.redis }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "genai-stack.fullname" . }}-redis
+  labels:
+    {{- include "genai-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: {{ .Values.redis.service.port }}
+      targetPort: {{ .Values.redis.service.port }}
+  selector:
+    {{- include "genai-stack.component.selectorLabels" (dict "componentName" "redis" "Chart" .Chart "Release" .Release "Values" .Values) | nindent 4 }}
+{{- end }}

@@ -1,198 +1,321 @@
+"""Streamlit frontend for the BankBot Crew onboarding workflow.
+
+The app collects basic customer information, calls the FastAPI gateway to launch
+the multi-agent CrewAI workflow, polls for status updates, and renders the advisor's
+credit-card recommendations so the user can confirm a final selection.
+
+The layout focuses on the required three-step experience:
+    1. 🎯 User Information — capture form inputs and uploaded document.
+    2. 🧠 AI Recommendations — display the cards returned by the AdvisorAgent.
+    3. ✅ Onboarding Complete — acknowledge the confirmed card.
+"""
+
 from __future__ import annotations
 
+import base64
+import os
 import time
-from typing import Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
 
-from components import advisor_chat, kyc_upload, onboarding, progress_tracker, results_summary
-from utils import api_client, state_manager
-from utils.api_client import APIClientError
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from streamlit.runtime.uploaded_file_manager import UploadedFile
 
-st.set_page_config(
-    page_title="BankBot Crew — Smart Onboarding Assistant",
-    page_icon="🏦",
-    layout="wide",
-)
+API_BASE_URL = os.getenv("GATEWAY_URL", "http://localhost:8000")
+REQUEST_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
+STATUS_POLL_INTERVAL = float(os.getenv("STATUS_POLL_INTERVAL", "2.0"))
+STATUS_POLL_TIMEOUT = int(os.getenv("STATUS_POLL_TIMEOUT", "120"))
+STAGE_ORDER = ["conversation", "kyc", "advisor", "audit"]
 
-st.markdown(
-    """
-    <style>
-        .stApp {
-            background-color: #f8f9fa;
-        }
-        .reportview-container .markdown-text-container {
-            font-size: 0.95rem;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="BankBot Crew Onboarding", page_icon="🏦", layout="centered")
 
 
-def handle_start(user_identifier: str) -> None:
-    state_manager.ensure_state_defaults()
-    with st.spinner("Connecting to the onboarding orchestrator..."):
+def _ensure_state_defaults() -> None:
+    """Initialize session_state keys used across the UI."""
+    defaults = {
+        "session_id": None,
+        "session_status": None,
+        "status_message": "",
+        "progress": {stage: "pending" for stage in STAGE_ORDER},
+        "recommendations": [],
+        "selected_card": None,
+        "confirmation_response": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _encode_document(uploaded_file: Optional["UploadedFile"]) -> Tuple[Optional[str], Optional[str]]:
+    """Convert an UploadedFile into base64 payload expected by the gateway."""
+    if not uploaded_file:
+        return None, None
+    file_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+    encoded = base64.b64encode(file_bytes).decode("utf-8")
+    return uploaded_file.name, encoded
+
+
+def _compute_progress(progress_map: Dict[str, str]) -> int:
+    """Convert a stage-status map into a 0-100 integer for the progress bar."""
+    weights = {"completed": 1.0, "in_progress": 0.5, "pending": 0.0, "error": 1.0}
+    total = 0.0
+    for stage in STAGE_ORDER:
+        status = progress_map.get(stage, "pending")
+        total += weights.get(status, 0.0)
+    percentage = int((total / len(STAGE_ORDER)) * 100)
+    return max(0, min(100, percentage))
+
+
+def _render_progress_badges(progress_map: Dict[str, str]) -> None:
+    """Display the stage-by-stage progress timeline."""
+    status_emojis = {
+        "pending": "⏳",
+        "in_progress": "🔄",
+        "completed": "✅",
+        "error": "⚠️",
+    }
+    cols = st.columns(len(STAGE_ORDER))
+    for idx, stage in enumerate(STAGE_ORDER):
+        with cols[idx]:
+            status = progress_map.get(stage, "pending")
+            st.markdown(f"**{status_emojis.get(status, '⏳')} {stage.title()}**")
+            st.caption(status.replace("_", " ").title())
+
+
+def start_onboarding(form_values: Dict[str, Any]) -> Optional[str]:
+    """Call POST /onboard and store the resulting session in Streamlit state."""
+    endpoint = f"{API_BASE_URL.rstrip('/')}/onboard"
+    try:
+        response = requests.post(endpoint, json=form_values, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        st.error(f"Unable to reach the onboarding gateway: {exc}")
+        return None
+
+    if response.status_code not in (200, 202):
+        st.error(f"Gateway returned {response.status_code}: {response.text}")
+        return None
+
+    payload = response.json()
+    session_id = payload.get("session_id")
+    if not session_id:
+        st.error("Gateway response did not include a session identifier.")
+        return None
+
+    st.session_state["session_id"] = session_id
+    st.session_state["session_status"] = payload.get("status")
+    st.session_state["status_message"] = payload.get("message", "")
+    return session_id
+
+
+def poll_status_until_terminal(session_id: str) -> Optional[Dict[str, Any]]:
+    """Poll GET /status until the workflow completes, fails, or times out."""
+    endpoint = f"{API_BASE_URL.rstrip('/')}/status/{session_id}"
+    status_placeholder = st.empty()
+    progress_bar = st.progress(0, text="Starting orchestration…")
+    timeline_placeholder = st.empty()
+    start_time = time.time()
+
+    while time.time() - start_time < STATUS_POLL_TIMEOUT:
         try:
-            response = api_client.start_onboarding(user_identifier)
-        except (requests.RequestException, APIClientError) as exc:
-            st.error(f"Unable to start onboarding right now. ({exc})")
-            return
-    task_id = response.get("task_id") or user_identifier
-    st.session_state["task_id"] = task_id
-    st.session_state["start_message"] = response.get("message", "Onboarding started.")
-    state_manager.set_step("kyc")
+            response = requests.get(endpoint, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            st.error(f"Error contacting status endpoint: {exc}")
+            return None
+
+        if response.status_code == 404:
+            st.error("The session could not be found. Please start again.")
+            return None
+
+        payload = response.json()
+        st.session_state["session_status"] = payload.get("status")
+        st.session_state["status_message"] = payload.get("message", "")
+        st.session_state["progress"] = payload.get("progress", st.session_state["progress"])
+
+        percentage = _compute_progress(st.session_state["progress"])
+        progress_bar.progress(percentage, text=f"Workflow status: {st.session_state['session_status']}")
+        status_placeholder.info(f"{st.session_state['status_message']} (updated {payload.get('updated_at')})")
+        with timeline_placeholder.container():
+            _render_progress_badges(st.session_state["progress"])
+
+        if st.session_state["session_status"] in {"completed", "failed"}:
+            return payload
+
+        time.sleep(STATUS_POLL_INTERVAL)
+
+    status_placeholder.warning("Polling timed out before the workflow completed.")
+    return None
 
 
-def handle_kyc_upload(file_obj) -> None:
-    state_manager.ensure_state_defaults()
-    task_id = st.session_state.get("task_id")
-    user_identifier = st.session_state.get("user_id")
-    primary_id = user_identifier or task_id
-    if not primary_id:
-        st.warning("Please start onboarding before uploading your document.")
+def fetch_recommendations(session_id: str) -> List[Dict[str, Any]]:
+    """Retrieve advisor recommendations for a completed session."""
+    endpoint = f"{API_BASE_URL.rstrip('/')}/recommendations/{session_id}"
+    try:
+        response = requests.get(endpoint, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        st.error(f"Unable to fetch recommendations: {exc}")
+        return []
+
+    if response.status_code == 202:
+        st.warning("Recommendations are not ready yet. Please wait a moment and try again.")
+        return []
+    if response.status_code >= 400:
+        st.error(f"Error fetching recommendations ({response.status_code}): {response.text}")
+        return []
+
+    payload = response.json()
+    recommendations = payload.get("recommendations") or []
+    st.session_state["recommendations"] = recommendations
+    return recommendations
+
+
+def confirm_selection(session_id: str, card_name: str, notes: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Send POST /confirm with the selected card."""
+    endpoint = f"{API_BASE_URL.rstrip('/')}/confirm/{session_id}"
+    body = {"selected_card": card_name, "notes": notes}
+
+    try:
+        response = requests.post(endpoint, json=body, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        st.error(f"Unable to confirm selection: {exc}")
+        return None
+
+    if response.status_code >= 400:
+        st.error(f"Confirmation failed ({response.status_code}): {response.text}")
+        return None
+
+    payload = response.json()
+    st.session_state["confirmation_response"] = payload
+    return payload
+
+
+def render_recommendation_grid(recommendations: List[Dict[str, Any]]) -> None:
+    """Render advisor recommendations using Streamlit columns."""
+    if not recommendations:
+        st.info("No recommendations available yet.")
         return
 
-    with st.spinner("Sending your document to the KYC agent..."):
-        try:
-            # Ensure the task_id follows the upload so the orchestrator can correlate documents.
-            response = api_client.upload_kyc(primary_id, file_obj, task_id=task_id)
-        except (requests.RequestException, APIClientError) as exc:
-            st.error(f"We hit a snag while uploading the document. ({exc})")
-            return
-    st.session_state["kyc_upload_response"] = response
-    st.session_state["kyc_status"] = response.get("status", "uploaded").capitalize()
+    st.header("🧠 AI Recommendations")
+    chunk_size = 2
+    for idx in range(0, len(recommendations), chunk_size):
+        cols = st.columns(chunk_size)
+        for offset, card in enumerate(recommendations[idx : idx + chunk_size]):
+            column = cols[offset]
+            with column:
+                name = card.get("name") or f"Card {idx + offset + 1}"
+                st.subheader(name)
+                summary = card.get("summary") or card.get("description") or "Tailored credit card option."
+                st.write(summary)
+                details = {k: v for k, v in card.items() if k not in {"name", "summary", "description"}}
+                if details:
+                    st.caption("\n".join(f"- **{k.title()}**: {v}" for k, v in details.items()))
 
 
-def handle_proceed_to_advisor() -> None:
-    state_manager.set_step("advisor")
-
-
-def handle_advice_prompt(prompt: str) -> None:
-    state_manager.ensure_state_defaults()
-    chat_history: List[Dict[str, str]] = st.session_state.get("chat_history", [])
-    chat_history.append({"role": "user", "content": prompt})
-    st.session_state["chat_history"] = chat_history
-
-    task_id = st.session_state.get("task_id") or st.session_state.get("user_id")
-    if not task_id:
-        st.warning("Start onboarding to chat with the advisor.")
+def render_confirmation_section(session_id: str, recommendations: List[Dict[str, Any]]) -> None:
+    """Allow the user to select and confirm a recommendation."""
+    if not recommendations:
         return
 
-    with st.spinner("Advisor is analysing your profile..."):
-        try:
-            response = api_client.get_advice(task_id, prompt)
-        except (requests.RequestException, APIClientError) as exc:
-            chat_history.append(
-                {
-                    "role": "assistant",
-                    "content": "I'm unable to fetch advice right now. Please try again shortly.",
-                }
-            )
-            st.error(f"Advisor service is unavailable. ({exc})")
-            return
+    card_names = [card.get("name") or f"Card {idx + 1}" for idx, card in enumerate(recommendations)]
+    st.session_state["selected_card"] = st.radio(
+        "Select the card that best fits your needs:",
+        card_names,
+        index=0 if card_names else None,
+        key="card_selection_radio",
+    )
+    notes = st.text_area("Optional notes for the banker (visible to the audit trail):", key="confirmation_notes")
 
-    advice = response.get("advice") or "Here's what I recommend based on your profile."
-    chat_history.append({"role": "assistant", "content": advice})
-    st.session_state["chat_history"] = chat_history
-    st.session_state["recommended_products"] = [
-        {"name": "Tailored Advisor Recommendation", "summary": advice}
-    ]
+    if st.button("Confirm Selection ✅"):
+        with st.spinner("Submitting your confirmation..."):
+            payload = confirm_selection(session_id, st.session_state["selected_card"], notes or None)
+        if payload:
+            st.success(f"Onboarding complete! You chose **{payload.get('selected_card')}**.")
+            st.session_state["session_status"] = payload.get("status")
+            st.session_state["status_message"] = payload.get("message")
 
 
-def handle_support_prompt(question: str) -> None:
-    state_manager.ensure_state_defaults()
-    st.session_state["support_prompt"] = ""
-    task_id = st.session_state.get("task_id") or st.session_state.get("user_id")
-    if not task_id:
-        st.warning("Start onboarding to reach the support agent.")
+def render_completion_summary() -> None:
+    """Display final confirmation details."""
+    response = st.session_state.get("confirmation_response")
+    if not response:
         return
 
-    with st.spinner("Checking in with the support agent..."):
-        try:
-            response = api_client.support_query(task_id, question)
-        except (requests.RequestException, APIClientError) as exc:
-            st.error(f"Support agent is unavailable. ({exc})")
-            return
-
-    answer = response.get("answer") or "We're working on your request and will update you soon."
-    history = st.session_state.get("support_history", [])
-    history.insert(0, {"question": question, "answer": answer})
-    st.session_state["support_history"] = history
-
-
-def handle_finalize() -> None:
-    state_manager.set_step("audit")
-    with st.spinner("Running compliance checks..."):
-        time.sleep(1.0)
-    state_manager.mark_audit_complete("Automated audit complete — no outstanding actions.")
-    if not st.session_state.get("kyc_status"):
-        st.session_state["kyc_status"] = "Verified"
-    if not st.session_state.get("recommended_products"):
-        st.session_state["recommended_products"] = [
-            {
-                "name": "SmartSaver Account",
-                "summary": "High-yield savings with zero maintenance fees and instant digital onboarding.",
-            }
-        ]
-    state_manager.set_step("results")
-
-
-def handle_restart() -> None:
-    state_manager.reset_state()
+    st.header("✅ Onboarding Complete")
+    st.success(
+        f"Your selection `{response.get('selected_card')}` has been recorded. "
+        "Our team will follow up shortly to finalize your account."
+    )
+    if notes := response.get("notes"):
+        st.caption(f"Notes sent to the audit trail: {notes}")
 
 
 def main() -> None:
-    state_manager.ensure_state_defaults()
+    """Entry point for the Streamlit app."""
+    _ensure_state_defaults()
 
-    health_payload = api_client.health_check()
-    backend_healthy = bool(health_payload and health_payload.get("status") == "ok")
-
-    current_step = st.session_state.get("step", "start")
-    step_statuses = state_manager.get_step_statuses(current_step)
-    progress_value = state_manager.get_progress_value(current_step)
-
-    progress_tracker.render_sidebar(
-        step_labels=state_manager.STEP_LABELS,
-        step_statuses=step_statuses,
-        progress_value=progress_value,
-        backend_healthy=backend_healthy,
+    st.title("🏦 BankBot Crew — Tailored Credit Card Guidance")
+    st.write(
+        "Kick off the AI-assisted onboarding journey, review curated credit card options, "
+        "and confirm the product that fits your lifestyle."
     )
 
-    st.markdown("<h1 style='color:#373737;'>🏦 BankBot Crew — Smart Onboarding Assistant</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='color:#373737;'>A multi-agent journey that guides you from signup to tailored product recommendations.</p>", unsafe_allow_html=True)
-
-    task_id = st.session_state.get("task_id")
-    if task_id:
-        st.markdown(f"<p style='color:#373737;'>Active Task ID: `{task_id}`</p>", unsafe_allow_html=True)
-
-    step = st.session_state.get("step", "start")
-
-    with st.container():
-        if step == "start":
-            onboarding.render(handle_start)
-        elif step == "kyc":
-            if message := st.session_state.get("start_message"):
-                st.success(message)
-            kyc_upload.render(handle_kyc_upload, handle_proceed_to_advisor)
-        elif step == "advisor":
-            advisor_chat.render(
-                chat_history=st.session_state.get("chat_history", []),
-                support_history=st.session_state.get("support_history", []),
-                on_user_prompt=handle_advice_prompt,
-                on_support_prompt=handle_support_prompt,
-                on_finalize=handle_finalize,
+    st.header("🎯 User Information")
+    with st.form("onboarding_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            name = st.text_input("Full Name", placeholder="Alex Morgan")
+            income = st.number_input("Annual Income (USD)", min_value=0.0, step=1000.0, format="%.2f")
+            occupation = st.text_input("Occupation", placeholder="Product Manager")
+        with col2:
+            email = st.text_input("Work Email", placeholder="alex@example.com")
+            preferences = st.text_area(
+                "Card Preferences",
+                placeholder="Reward categories, travel perks, cash back goals...",
+                height=100,
             )
-        elif step == "results":
-            results_summary.render(
-                kyc_status=st.session_state.get("kyc_status", "Verified"),
-                recommended_products=st.session_state.get("recommended_products", []),
-                audit_note=st.session_state.get("audit_note", ""),
-                on_restart=handle_restart,
-            )
+            document = st.file_uploader("Upload KYC Document (PDF/Image)", type=["pdf", "png", "jpg", "jpeg"])
+
+        submitted = st.form_submit_button("Start Onboarding 🚀")
+
+    if submitted:
+        if not all([name, email, occupation]) or income <= 0:
+            st.error("Please fill in the required fields (name, email, income, occupation).")
         else:
-            st.info("Let’s continue your onboarding journey.")
+            document_name, document_payload = _encode_document(document)
+            payload = {
+                "name": name,
+                "email": email,
+                "income": income,
+                "occupation": occupation,
+                "preferences": preferences or None,
+                "document_name": document_name,
+                "document_content": document_payload,
+            }
+            with st.spinner("Contacting the gateway to start your onboarding journey..."):
+                session_id = start_onboarding(payload)
+            if session_id:
+                status_payload = poll_status_until_terminal(session_id)
+                if status_payload and st.session_state["session_status"] == "completed":
+                    with st.spinner("Fetching advisor recommendations..."):
+                        fetch_recommendations(session_id)
+
+    if st.session_state.get("session_status") in {"completed", "confirmed"}:
+        render_recommendation_grid(st.session_state.get("recommendations", []))
+        if st.session_state.get("session_status") == "completed":
+            render_confirmation_section(st.session_state["session_id"], st.session_state.get("recommendations", []))
+        render_completion_summary()
+    elif st.session_state.get("session_status") == "failed":
+        st.error(
+            "The AI workflow encountered an issue. Please adjust the input data or retry once the service is available."
+        )
+
+    if st.session_state.get("confirmation_response"):
+        if st.button("Start a New Onboarding Session 🔁"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            _ensure_state_defaults()
 
 
 if __name__ == "__main__":

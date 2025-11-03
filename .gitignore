@@ -1,1 +1,11 @@
-.venv
+# Terraform-Specific Files
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+
+# macOS system files
+.DS_Store
+
+# python
+**/.venv/
+**/venv/
+__pycache__/

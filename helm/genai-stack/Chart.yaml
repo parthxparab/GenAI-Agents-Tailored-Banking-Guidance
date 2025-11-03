@@ -1,0 +1,7 @@
+apiVersion: v2
+name: genai-stack
+description: Helm chart packaging Redis, gateway, and agent services for the tailored banking guidance platform
+icon: ""
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
