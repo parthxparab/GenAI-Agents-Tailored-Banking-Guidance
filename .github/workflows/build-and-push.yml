@@ -1,0 +1,117 @@
+name: Build and Push Images
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 403277717302.dkr.ecr.us-east-1.amazonaws.com
+  HELM_CHART_BUCKET: s3://helm-chart-e107d0a4
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed for committing changes back to repo
+      id-token: write # Needed for AWS authentication
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Set up Docker Buildx for layer caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build and push images for all services in parallel
+      - name: Build and push images
+        id: build-images
+        run: |
+          # Initialize an associative array to store image digests
+          declare -A image_digests
+
+          # Function to build and push a single service
+          build_service() {
+            local service=$1
+            local dockerfile_path=$2
+            local image_name="genai/${service}"
+            local full_image_name="${ECR_REGISTRY}/${image_name}"
+            
+            echo "Building ${service}..."
+            
+            # Build and push with both latest and SHA tags
+            docker buildx build \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --platform linux/amd64 \
+              --push \
+              -t "${full_image_name}:latest" \
+              -t "${full_image_name}:${GITHUB_SHA}" \
+              -f "${dockerfile_path}" \
+              "${dockerfile_path%/*}"
+            
+            # Get the digest of the pushed image
+            digest=$(docker inspect "${full_image_name}:latest" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+            echo "digest=${digest}" >> "$GITHUB_ENV"
+            image_digests["${service}"]="${digest}"
+            echo "${service}_digest=${digest}" >> $GITHUB_OUTPUT
+          }
+
+          # Build all services in parallel
+          build_service "frontend" "./frontend/Dockerfile" &
+          build_service "advisor" "./agents/advisor/Dockerfile" &
+          build_service "audit" "./agents/audit/Dockerfile" &
+          build_service "conversation" "./agents/conversation/Dockerfile" &
+          build_service "kyc" "./agents/kyc/Dockerfile" &
+          
+          # Wait for all parallel builds to complete
+          wait
+
+      # Update Helm values.yaml with new image digests
+      - name: Update Helm values
+        run: |
+          # Use yq to update only the image.digest fields
+          for service in frontend advisor audit conversation kyc; do
+            digest_var="${service}_digest"
+            yq -i ".${service}.image.digest = \"${!digest_var}\"" ./helm/values.yaml
+          done
+
+      # Bump chart version
+      - name: Bump Helm chart version
+        id: bump-version
+        run: |
+          chmod +x ./scripts/bump_chart_version.sh
+          new_version=$(./scripts/bump_chart_version.sh)
+          echo "new_version=${new_version}" >> $GITHUB_OUTPUT
+
+      # Package Helm chart
+      - name: Package Helm chart
+        run: |
+          helm package ./helm
+
+      # Push chart to S3
+      - name: Push Helm chart to S3
+        run: |
+          chart_file="genai-${{ steps.bump-version.outputs.new_version }}.tgz"
+          aws s3 cp "${chart_file}" "${HELM_CHART_BUCKET}/"
+
+      # Commit changes back to repo
+      - name: Commit changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add ./helm/values.yaml ./helm/Chart.yaml
+          git commit -m "chore: update image digests and bump chart version"
+          git push
