@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 import redis
 
 from credit_cards import CREDIT_CARDS
-from genai_client import run_llm
+from langchain_client import get_credit_card_recommendations
 
 LOG_FORMAT = "[%(asctime)s] [ADVISOR_AGENT] %(levelname)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -23,6 +23,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 ADVISOR_CHANNEL = os.getenv("ADVISOR_CHANNEL", "advisor")
 ORCHESTRATOR_CHANNEL = os.getenv("ORCHESTRATOR_CHANNEL", "orchestrator")
 RECOMMENDATION_COUNT = int(os.getenv("ADVISOR_RECOMMENDATIONS", "3"))
+ADVISOR_LLM_MODEL = os.getenv("ADVISOR_LLM_MODEL", "llama3")
 
 
 def connect_redis() -> redis.Redis:
@@ -30,39 +31,82 @@ def connect_redis() -> redis.Redis:
     return redis.from_url(REDIS_URL)
 
 
-def build_prompt(user_profile: Dict[str, Any], cards: List[Dict[str, str]]) -> str:
-    return f"""
-You are a helpful banking product advisor working for a regulated bank.
-The user is seeking a credit card recommendation as part of an onboarding journey.
-
-USER PROFILE:
-{json.dumps(user_profile, indent=2)}
-
-AVAILABLE CREDIT CARDS:
-{json.dumps(cards, indent=2)}
-
-Choose the top {RECOMMENDATION_COUNT} cards that best match the user's intent and profile.
-For each card include the keys: card_name, annual_fee, interest_rate, rewards, requirements, why_recommended.
-Return ONLY valid JSON matching this structure:
-{{
-  "recommendations": [
-    {{
-      "card_name": "...",
-      "annual_fee": "...",
-      "interest_rate": "...",
-      "rewards": "...",
-      "requirements": "...",
-      "why_recommended": "..."
-    }}
-  ]
-}}
-    """.strip()
+def extract_user_profile(message: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract and normalize user profile from message.
+    Supports both new format (case_id, address, yearly_income, questions) and old format.
+    """
+    # Check for new format
+    if "case_id" in message or "yearly_income" in message or "questions" in message:
+        case_id = message.get("case_id") or message.get("task_id", "unknown")
+        address = message.get("address", "")
+        yearly_income = message.get("yearly_income", 0)
+        questions = message.get("questions", {})
+        
+        # Ensure questions is a dict
+        if not isinstance(questions, dict):
+            questions = {}
+        
+        return {
+            "case_id": case_id,
+            "address": address,
+            "yearly_income": yearly_income,
+            "questions": questions,
+        }
+    
+    # Old format compatibility - map to new format
+    user_profile = message.get("user_profile", {})
+    old_intent = user_profile.get("intent", "")
+    old_preferences = user_profile.get("preferences", "")
+    
+    # Try to infer question answers from old format
+    questions = {}
+    if "student" in old_intent.lower() or "building" in old_preferences.lower():
+        questions["q1_credit_history"] = "building"
+    elif "established" in old_preferences.lower():
+        questions["q1_credit_history"] = "established"
+    
+    if "low" in old_preferences.lower() and "apr" in old_preferences.lower():
+        questions["q2_payment_style"] = "lower apr"
+    else:
+        questions["q2_payment_style"] = "full payment"
+    
+    if "cashback" in old_preferences.lower():
+        questions["q3_cashback"] = "yes"
+    else:
+        questions["q3_cashback"] = "no"
+    
+    if "travel" in old_preferences.lower():
+        questions["q4_travel"] = "yes"
+    else:
+        questions["q4_travel"] = "no"
+    
+    if "no fee" in old_preferences.lower() or "simple" in old_preferences.lower():
+        questions["q5_simple_card"] = "yes"
+    else:
+        questions["q5_simple_card"] = "no"
+    
+    return {
+        "case_id": message.get("task_id", "unknown"),
+        "address": user_profile.get("address", ""),
+        "yearly_income": user_profile.get("yearly_income", 30000),  # Default fallback
+        "questions": questions,
+    }
 
 
 def validate_recommendations(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate recommendations and ensure card names exist in CREDIT_CARDS.
+    """
     recommendations = payload.get("recommendations")
     if not isinstance(recommendations, list):
         raise ValueError("Missing recommendations list.")
+
+    # Get valid card names from CREDIT_CARDS
+    valid_card_names = {card["card_name"] for card in CREDIT_CARDS}
+    
+    # Create a lookup for card details
+    card_lookup = {card["card_name"]: card for card in CREDIT_CARDS}
 
     cleaned: List[Dict[str, str]] = []
     for item in recommendations[:RECOMMENDATION_COUNT]:
@@ -71,7 +115,25 @@ def validate_recommendations(payload: Dict[str, Any]) -> Dict[str, Any]:
         required_keys = {"card_name", "annual_fee", "interest_rate", "rewards", "requirements", "why_recommended"}
         if not required_keys.issubset(item):
             continue
-        normalized = {key: str(item.get(key, "")).strip() for key in required_keys}
+        
+        card_name = str(item.get("card_name", "")).strip()
+        
+        # Validate card name exists in CREDIT_CARDS
+        if card_name not in valid_card_names:
+            logger.warning("Invalid card name '%s' not found in CREDIT_CARDS, skipping", card_name)
+            continue
+        
+        # Ensure card details match the original card data
+        original_card = card_lookup.get(card_name, {})
+        normalized = {
+            "card_name": card_name,
+            "annual_fee": str(item.get("annual_fee", original_card.get("annual_fee", ""))).strip(),
+            "interest_rate": str(item.get("interest_rate", original_card.get("interest_rate", ""))).strip(),
+            "rewards": str(item.get("rewards", original_card.get("rewards", ""))).strip(),
+            "requirements": str(item.get("requirements", original_card.get("requirements", ""))).strip(),
+            "why_recommended": str(item.get("why_recommended", "")).strip(),
+        }
+        
         if any(not normalized[key] for key in required_keys):
             continue
         cleaned.append(normalized)
@@ -96,20 +158,22 @@ def fallback_recommendations() -> Dict[str, Any]:
 
 
 def recommend_credit_cards(user_profile: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = build_prompt(user_profile, CREDIT_CARDS)
-    logger.info("Prompting LLM for advisor recommendations.")
-    response = run_llm(prompt)
-
-    if isinstance(response, dict) and "error" in response:
-        logger.error("LLM returned error: %s", response)
-        return fallback_recommendations()
-
+    """
+    Get credit card recommendations using Langchain.
+    Accepts new format with case_id, address, yearly_income, and questions.
+    """
+    logger.info("Getting credit card recommendations using Langchain.")
+    
     try:
+        # Use Langchain client
+        response = get_credit_card_recommendations(user_profile, CREDIT_CARDS)
+        
+        # Validate the response
         validated = validate_recommendations(response)
-        logger.info("Validated recommendations from LLM.")
+        logger.info("Validated recommendations from Langchain.")
         return validated
     except Exception as exc:
-        logger.error("Failed to validate LLM response (%s). Falling back.", exc)
+        logger.error("Failed to get Langchain recommendations (%s). Falling back.", exc)
         return fallback_recommendations()
 
 
@@ -123,7 +187,6 @@ def handle_message(redis_client: redis.Redis, message: Dict[str, Any]) -> None:
     task_id = message.get("task_id")
     user_id = message.get("user_id")
     step = message.get("step")
-    user_profile = message.get("user_profile", {})
 
     valid_steps = {"advisor_start", "advisor_query"}
     if step not in valid_steps:
@@ -135,6 +198,10 @@ def handle_message(redis_client: redis.Redis, message: Dict[str, Any]) -> None:
         return
 
     logger.info("Processing advisor_start for task_id=%s user_id=%s", task_id, user_id)
+    
+    # Extract user profile using new format with backward compatibility
+    user_profile = extract_user_profile(message)
+    
     recommendations = recommend_credit_cards(user_profile)
 
     outgoing = {
@@ -194,11 +261,16 @@ def listen_for_messages() -> None:
 def simulate_mode() -> None:
     logger.info("Simulation mode activated.")
     sample_profile = {
-        "full_name": "Simulated User",
-        "dob": "1990-01-01",
-        "country": "Canada",
-        "intent": "credit_card",
-        "preferences": "cashback and low fees",
+        "case_id": "sim_001",
+        "address": "123 Main St, Toronto, ON, Canada",
+        "yearly_income": 45000,
+        "questions": {
+            "q1_credit_history": "established",
+            "q2_payment_style": "full payment",
+            "q3_cashback": "yes",
+            "q4_travel": "no",
+            "q5_simple_card": "yes",
+        },
     }
     recommendations = recommend_credit_cards(sample_profile)
     logger.info("Simulation recommendations: %s", json.dumps(recommendations, indent=2))
