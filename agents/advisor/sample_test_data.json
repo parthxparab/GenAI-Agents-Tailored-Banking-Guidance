@@ -1,0 +1,13 @@
+{
+  "case_id": "sample_001",
+  "address": "123 Main Street, Toronto, ON, Canada",
+  "yearly_income": 45000,
+  "questions": {
+    "q1_credit_history": "established",
+    "q2_payment_style": "full payment",
+    "q3_cashback": "yes",
+    "q4_travel": "no",
+    "q5_simple_card": "yes"
+  }
+}
+
