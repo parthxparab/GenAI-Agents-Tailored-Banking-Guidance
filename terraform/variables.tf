@@ -220,3 +220,28 @@ variable "remote_state_dynamodb_table" {
   type        = string
   default     = ""
 }
+
+// Bedrock + IRSA configuration
+variable "bedrock_model_id" {
+  description = "Amazon Bedrock modelId to allow (e.g., meta.llama3-2-11b-vision-instruct-v1:0). Ensure model access is approved in the selected region."
+  type        = string
+  default     = "meta.llama3-2-11b-vision-instruct-v1:0"
+}
+
+variable "bedrock_service_account_name" {
+  description = "Kubernetes ServiceAccount name whose pods should assume the Bedrock IRSA role."
+  type        = string
+  default     = "gateway"
+}
+
+variable "bedrock_service_account_namespace" {
+  description = "Kubernetes namespace for the ServiceAccount bound to the IRSA role."
+  type        = string
+  default     = "genai"
+}
+
+variable "create_bedrock_vpc_endpoint" {
+  description = "Create an Interface VPC Endpoint (PrivateLink) for Bedrock Runtime to keep traffic in-VPC."
+  type        = bool
+  default     = false
+}
